@@ -1,0 +1,7 @@
+include TEMPLATE-LICENSE TEMPLATE-NOTICE.md
+include LICENSE UPSTREAM-LICENSE UPSTREAM-COMMIT NOTICE.md anyeval.json redaction.yaml
+include CobolEval.jsonl
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include scaffolds *.yaml
+include run.py bundle.template.json

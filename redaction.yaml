@@ -1,0 +1,5 @@
+version: 1
+redact: [tests, test, result, value, type_, canonical_solution]
+global: [target, targets, answer, explanation]
+sandbox_exec: [input, stdout, stderr]
+# Runtime private_grading suppression protects exporters independently of this policy.

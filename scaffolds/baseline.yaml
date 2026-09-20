@@ -1,0 +1,10 @@
+id: baseline
+version: 1
+description: Upstream system-only chat prompt, first fenced completion, all-callers pass@1.
+upstream_default: true
+budget:
+  max_turns: 1
+  max_tokens: null
+notes: >
+  No tools or test feedback. One epoch. Report model generation settings.
+  Upstream uses temperature 0.0; this package leaves sampling to the caller.

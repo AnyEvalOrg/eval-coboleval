@@ -1,0 +1,43 @@
+{
+  "$schema": "https://anyeval.com/schema/bundle/1",
+  "bundle_version": 1,
+  "generated_at": null,
+  "eval": {
+    "id": "coboleval",
+    "task": null,
+    "sample_id": null
+  },
+  "upstream": {
+    "repo": "https://github.com/zorse-project/COBOLEval",
+    "inspect_ai": "0.3.260"
+  },
+  "dataset": {
+    "source": "COBOLEval",
+    "revision": "0bb96c3114bb2bb28e221e9d6000614781f8609d"
+  },
+  "model": {
+    "name": null,
+    "provider": null,
+    "served": []
+  },
+  "scaffold": {
+    "id": "baseline",
+    "version": 1,
+    "token_limit": null
+  },
+  "sandbox": {
+    "class": null,
+    "provenance": null
+  },
+  "scorer": {
+    "name": "coboleval_scorer",
+    "metric": "pass@1"
+  },
+  "receipts": [],
+  "routing": [],
+  "outputs": {
+    "status": null,
+    "score": null,
+    "explanation": null
+  }
+}

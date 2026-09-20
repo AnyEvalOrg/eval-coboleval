@@ -1,0 +1,55 @@
+{
+  "anyeval_version": 1,
+  "eval": {
+    "id": "coboleval",
+    "slug": "coboleval",
+    "title": "COBOLEval: COBOL Program Completion",
+    "group": "Coding",
+    "tags": [
+      "coding",
+      "cobol",
+      "sandbox",
+      "pass@1"
+    ],
+    "source": "upstream"
+  },
+  "upstream": {
+    "repo": "https://github.com/zorse-project/COBOLEval",
+    "path": "data/CobolEval.jsonl",
+    "commit": "0bb96c3114bb2bb28e221e9d6000614781f8609d",
+    "inspect_ai": "0.3.260",
+    "eval_version": "1.0.0",
+    "dependency": ""
+  },
+  "execution": {
+    "class": "sandbox-k8s",
+    "cost_class": "medium",
+    "sandbox": "k8s",
+    "requires_internet": false,
+    "fast": false,
+    "supports_k8s": true,
+    "environment": "coboleval/values.yaml"
+  },
+  "tasks": [
+    {
+      "name": "coboleval",
+      "samples": 146
+    }
+  ],
+  "total_samples": 146,
+  "external_assets": [
+    {
+      "type": "container",
+      "source": "us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-cobol-sandbox:1.0.0"
+    },
+    {
+      "type": "container",
+      "source": "coredns/coredns:1.8.3",
+      "condition": "Explicit anyeval_chart=false exception only; absent from default chart"
+    }
+  ],
+  "scaffolds": [
+    "baseline"
+  ],
+  "generated": "2026-09-20"
+}
