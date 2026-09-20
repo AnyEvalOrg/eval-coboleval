@@ -26,7 +26,7 @@ The runner rejects wildcard and unknown IDs. It records only the selected sample
 
 ## Prompt and program assembly
 
-The prompt is the exact `OPENAI_SYSTEM_PROMPT.format(record['prompt'])` from upstream `scripts/generate.py`, including the unlabeled fence and instruction to terminate with `GOBACK`. Upstream `OpenAIChat.solve` sends **one system message and no user message**. This package preserves that message layout instead of adding another request. The record's prompt includes its program header, linkage declarations, public docstring/examples, completion instruction and working-storage header. Caller code, expected results and the Python canonical solution never enter model input, targets, or sample metadata.
+The prompt is the exact `OPENAI_SYSTEM_PROMPT.format(record['prompt'])` from upstream `scripts/generate.py`, including the unlabeled fence and instruction to terminate with `GOBACK`. Upstream `OpenAIChat.solve` sends **one system message and no user message**. This package sends the same text byte-for-byte as **one user message with no system message** because OpenAI-compatible endpoints reject system-only conversations (HTTP 400: "messages must contain at least one user message"). Only the role changes. The record's prompt includes its program header, linkage declarations, public docstring/examples, completion instruction and working-storage header. Caller code, expected results and the Python canonical solution never enter model input, targets, or sample metadata.
 
 The first Markdown fenced block is selected, irrespective of language label. Later blocks are ignored. Standard CommonMark tilde, nested and EOF-terminated fences are accepted; unfenced responses score INCORRECT without starting the sandbox. An empty fenced block is still assembled and submitted to the compiler, matching upstream construction.
 
@@ -69,6 +69,7 @@ Grading data stays in the scorer closure and package data. `private_grading` sup
 
 Differences from the upstream harness are explicit:
 
+- The upstream prompt text is unchanged, but its role is changed from system to user for compatibility with endpoints that reject system-only conversations.
 - Standard CommonMark fence parsing uses `markdown-it-py` instead of Marko; the first-fence selection policy is retained. Parser-specific edge behavior is not asserted byte-identical for every possible Markdown document.
 - Missing fenced code becomes INCORRECT instead of an extraction exception causing a skipped generation. There are no upstream API retries or joblib generation cache.
 - Upstream leaves the execution call commented out. Here it runs in a sandbox with shell-free argv, independent 60/30-second deadlines, output bounds and authenticated receipts; upstream's general shell helper uses a 5-second timeout.

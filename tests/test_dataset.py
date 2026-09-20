@@ -38,9 +38,9 @@ def test_prompt_uses_only_upstream_prompt_and_no_tests_or_results():
         assert set(sample.metadata) == {'task_id', 'entry_point'}
         assert not sample.target
         assert len(sample.input) == 1
-        assert sample.input[0].role == 'system'
-        if sample.input[0].content != OPENAI_SYSTEM_PROMPT.format(record['prompt']):
-            pytest.fail('Chat message differs from upstream')
+        assert sample.input[0].role == 'user'
+        if sample.input[0].content.encode('utf-8') != OPENAI_SYSTEM_PROMPT.format(record['prompt']).encode('utf-8'):
+            pytest.fail('Chat message bytes differ from upstream')
 
 
 def test_all_expected_values_are_safe_literals_and_all_callers_retained():

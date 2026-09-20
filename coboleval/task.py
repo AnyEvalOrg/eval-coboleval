@@ -5,14 +5,14 @@ from pathlib import Path
 from inspect_ai import Task, task
 from inspect_ai.dataset import MemoryDataset, Sample
 from inspect_ai.solver import generate
-from inspect_ai.model import ChatMessageSystem
+from inspect_ai.model import ChatMessageUser
 from .dataset import load_records, manifest
 from .prompts import system_prompt
 from .scoring import coboleval_scorer
 
 
 def record_to_sample(record: dict) -> Sample:
-    return Sample(id=record['task_id'], input=[ChatMessageSystem(content=system_prompt(record))],
+    return Sample(id=record['task_id'], input=[ChatMessageUser(content=system_prompt(record))],
                   metadata={'task_id': record['task_id'], 'entry_point': record['entry_point']})
 
 

@@ -159,13 +159,16 @@ def test_output_limit_is_incorrect(monkeypatch):
     "2<completed-sentinel-value-0>",
     signed_receipt(b"wrong key", "/tmp/cjt-fresh_1"),
     '{"returncode":0,"output":"2"}',
-])
+], ids=['completion-marker', 'wrong-hmac-key', 'unsigned-receipt'])
 def test_forged_completion_marker_or_receipt_is_incorrect(monkeypatch, forgery):
-    fake = FakeSandbox([forgery])
+    # A valid second response makes accidental acceptance score CORRECT instead
+    # of hiding behind an exhausted iterator on the second caller.
+    fake = FakeSandbox([forgery, result()])
     install_sandbox(monkeypatch, fake)
     score = asyncio.run(scoring.coboleval_scorer()(state(), Target("")))
+    assert fake.paths == ['/tmp/cjt-fresh_1']  # No second setup after rejection.
     assert score.value == INCORRECT
-    assert "supervisor did not complete" in score.explanation
+    assert score.explanation == 'Test 1: supervisor did not complete. Compiled: unknown.'
 
 
 def test_marker_inside_captured_candidate_output_cannot_hide_failure(monkeypatch):
@@ -313,9 +316,13 @@ def test_cleanup_requires_quiescence_before_reusing_sandbox(monkeypatch):
 
 
 def test_receipt_for_another_directory_is_incorrect(monkeypatch):
-    fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/cjt-other')])
+    # The signature is valid; only binding to this caller's directory rejects it.
+    fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/cjt-other'), result()])
     install_sandbox(monkeypatch, fake)
-    assert asyncio.run(scoring.coboleval_scorer()(state(), Target(''))).value == INCORRECT
+    score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    assert fake.paths == ['/tmp/cjt-fresh_1']  # No second setup after rejection.
+    assert score.value == INCORRECT
+    assert score.explanation == 'Test 1: supervisor did not complete. Compiled: unknown.'
 
 
 @pytest.mark.parametrize('completion', ['no code', '    indented source'])
