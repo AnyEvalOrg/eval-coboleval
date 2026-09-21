@@ -44,7 +44,9 @@ def signed_receipt(key, cwd, output="2", **kwargs):
     body = json.dumps(dict(returncode=kwargs.get("returncode", 0),
                            timeout=kwargs.get("timeout", False),
                            overflow=kwargs.get("overflow", False), stage=kwargs.get("stage", "run"), cwd=cwd,
-                           output=base64.b64encode(output.encode()).decode()))
+                           cleanup_failed=kwargs.get("cleanup_failed", False),
+                           supervisor_error=kwargs.get("supervisor_error", False),
+                           output=base64.b64encode(output if isinstance(output, bytes) else output.encode()).decode()))
     return json.dumps({"body": body, "tag": hmac.new(key, body.encode(), hashlib.sha256).hexdigest()})
 
 
@@ -422,3 +424,59 @@ def test_compile_success_with_excess_output_is_still_incorrect(monkeypatch):
     score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
     assert score.value == INCORRECT
     assert 'Compiled: yes' in score.explanation
+
+
+def resign(fields, key=bytes(range(32))):
+    import hashlib
+    import hmac
+    body = json.dumps(fields)
+    return json.dumps(dict(body=body, tag=hmac.new(key, body.encode(), hashlib.sha256).hexdigest()))
+
+
+@pytest.mark.parametrize('output', [b'\xff', b'good\xffbad'])
+def test_authenticated_non_utf8_is_incorrect(monkeypatch, output):
+    fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1', output)])
+    install_sandbox(monkeypatch, fake)
+    score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    assert score.value == INCORRECT
+    assert 'output not decodable' in score.explanation
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+
+
+@pytest.mark.parametrize('output', [None, 42, [], {}, '\u2603', '%%%','/w=='])
+def test_candidate_output_shape_does_not_invalidate_authentication(monkeypatch, output):
+    fields = json.loads(json.loads(signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1'))['body'])
+    fields['output'] = output
+    response = resign(fields)
+    assert scoring.verify_receipt(response, bytes(range(32)))['output_error']
+    assert scoring.verify_receipt(response, b'bad key') is None
+    fake = FakeSandbox([response])
+    install_sandbox(monkeypatch, fake)
+    score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    assert score.value == INCORRECT and 'output not decodable' in score.explanation
+
+
+def test_missing_output_is_authenticated_failure():
+    fields = json.loads(json.loads(signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1'))['body'])
+    del fields['output']
+    assert scoring.verify_receipt(resign(fields), bytes(range(32)))['output_error']
+
+
+@pytest.mark.parametrize('field,value', [('stage', []), ('stage', 'other'), ('returncode', True),
+    ('timeout', 0), ('overflow', None), ('cwd', '/tmp/other'), ('cwd', []),
+    ('cleanup_failed', 'yes'), ('supervisor_error', 1)])
+def test_supervisor_fields_still_require_strict_shapes(field, value):
+    fields = json.loads(json.loads(signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1'))['body'])
+    fields[field] = value
+    assert scoring.verify_receipt(resign(fields), bytes(range(32))) is None
+
+
+@pytest.mark.parametrize('flag', ['cleanup_failed', 'supervisor_error'])
+def test_signed_post_run_failure_is_incorrect_and_independently_cleaned(monkeypatch, flag):
+    fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1', **{flag: True})])
+    install_sandbox(monkeypatch, fake)
+    score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    assert score.value == INCORRECT
+    assert fake.calls[-2][0] == scoring.CLEANUP_COMMAND
+    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert len(fake.paths) == 1

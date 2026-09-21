@@ -1,0 +1,25 @@
+# Run from the repository root:
+# gcloud builds submit --config=scripts/cloudbuild-linux-regressions.yaml \
+#   --substitutions=_IMAGE=REGION-docker.pkg.dev/PROJECT/REPO/IMAGE@sha256:DIGEST .
+# The Cloud Build service account must be able to pull the reference image.
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-cobol-sandbox:1.0.0
+steps:
+  - name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        docker pull '${_IMAGE}'
+        # The reference image has Python and prlimit but no Docker CLI. Share
+        # this builder's CLI via /workspace; do not install host scoring deps.
+        mkdir -p /workspace/.linux-regressions-bin
+        cp "$$(command -v docker)" /workspace/.linux-regressions-bin/docker
+        docker run --rm --init --network=none --memory=2g --memory-swap=2g \
+          --pids-limit=128 --user=0:0 \
+          --mount type=bind,source=/workspace,target=/workspace,readonly \
+          --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock \
+          --env PATH=/workspace/.linux-regressions-bin:/usr/local/bin:/usr/bin:/bin \
+          '${_IMAGE}' /usr/local/bin/python3 /workspace/scripts/linux_regressions.py \
+          --image '${_IMAGE}'
+timeout: 600s

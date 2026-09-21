@@ -28,6 +28,11 @@ services:
         add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
       seccompProfile:
         type: RuntimeDefault
+    # Equal CPU/memory requests and limits give Guaranteed QoS, avoiding
+    # eviction preference for a Burstable supervisor. Each COBOL child has
+    # RLIMIT_AS/RLIMIT_DATA=1 GiB; 2 GiB leaves headroom for root supervision,
+    # compiler helpers and capture buffers. Children inherit oom_score_adj=1000.
+    # RLIMIT_NPROC=64 reserves slots below the reference Docker pids limit (128).
     resources:
       requests:
         cpu: "1"

@@ -3,9 +3,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import base64
-import hashlib
-import hmac
 import json
 import io
 import re
@@ -14,6 +11,7 @@ from inspect_ai.scorer import CORRECT, INCORRECT, Score, Target, accuracy, score
 from inspect_ai.solver import TaskState
 from inspect_ai.util import sandbox
 
+from .receipts import verify_receipt, receipt_failure
 from .dataset import load_records
 from .publication import private_grading
 from .sandbox_runner import CLEANUP_COMMAND, QUIESCENCE_COMMAND, RUNNER, SETUP
@@ -115,14 +113,9 @@ def coboleval_scorer():
             compiled = "yes" if (receipt['stage'] == 'run' or
                                  (receipt['returncode'] == 0 and not receipt['timeout'])) else "no"
             evidence = f" Compiled: {compiled} (caller {index}; later callers not attempted)."
-            if receipt["timeout"]:
-                return Score(value=INCORRECT, explanation=f"Test {index}: {receipt['stage']} timeout." + evidence)
-            if receipt["overflow"]:
-                return Score(value=INCORRECT, explanation=f"Test {index}: output limit exceeded." + evidence)
-            if receipt["returncode"] != 0:
-                return Score(value=INCORRECT, explanation=f"Test {index}: {receipt['stage']} error (exit {receipt['returncode']})." + evidence)
-            if receipt['stage'] != 'run':
-                return Score(value=INCORRECT, explanation=f"Test {index}: run did not complete." + evidence)
+            failure = receipt_failure(receipt)
+            if failure is not None:
+                return Score(value=INCORRECT, explanation=f"Test {index}: {failure}." + evidence)
             if not cobol_matches(receipt['output'], test['result']):
                 return Score(value=INCORRECT, explanation=f"Test {index}: wrong answer." + evidence)
         return Score(value=CORRECT, explanation=f"All {len(tests)} tests passed. Compiled: yes (all {len(tests)} callers).")
@@ -160,23 +153,3 @@ async def cleanup_candidate(environment, not_before: float = 0) -> None:
     except Exception:
         # In particular do not turn a cleanup timeout into a candidate verdict.
         raise RuntimeError("Private sandbox cleanup failed; details withheld.") from None
-
-
-def verify_receipt(stdout: str, key: bytes) -> dict | None:
-    """Authenticate exact wrapper bytes before interpreting status or output."""
-    try:
-        envelope = json.loads(stdout)
-        body, tag = envelope["body"], envelope["tag"]
-        if not hmac.compare_digest(hmac.new(key, body.encode(), hashlib.sha256).hexdigest(), tag):
-            return None
-        receipt = json.loads(body)
-        if (type(receipt["returncode"]) is not int
-                or type(receipt["timeout"]) is not bool
-                or type(receipt["overflow"]) is not bool
-                or receipt.get("stage") not in {"compile", "run"}
-                or not re.fullmatch(r"/tmp/cjt-[a-zA-Z0-9_-]+", receipt["cwd"])):
-            return None
-        receipt["output"] = base64.b64decode(receipt["output"], validate=True).decode("utf-8")
-        return receipt
-    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
-        return None

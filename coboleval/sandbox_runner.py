@@ -6,7 +6,7 @@ generates the key locally; no ancestor shell receives it as stdin or an argument
 The root supervisor drops the child to reserved UID/GID 65532 before exec.
 PR_SET_DUMPABLE also protects supervisor memory/fds.
 The child has separate stdio, no inherited supervisor descriptors, no core dumps,
-no privilege gains, and a bounded process limit (compiler subprocesses and JVM threads are required).
+no privilege gains, and bounded memory and process limits (compiler subprocesses are required).
 Only the supervisor can authenticate the wait() status. Provider stdout markers
 can truncate/destroy the receipt, but cannot manufacture a valid passing receipt.
 """
@@ -17,7 +17,7 @@ CANDIDATE_GID = 65532
 CLEANUP_COMMAND = ["timeout", "-s", "KILL", "5s",
                    "/usr/bin/pkill", "-KILL", "-u", str(CANDIDATE_UID)]
 
-# Compilers need forks and JVMs need threads. After the template's independent
+# Compilers need forks. After the template's independent
 # pkill exec, verify quiescence with repeated UID sweeps (escaped sessions too).
 # Ignore zombies: they cannot execute and belong to the container's reaper.
 UID_QUIESCENCE = r'''
@@ -101,12 +101,24 @@ def restrict_child():
         os._exit(125)
     if libc.prctl(8, 0, 0, 0, 0) != 0:  # PR_SET_KEEPCAPS = 0
         os._exit(125)
+    # Still root in the supervisor's preexec child: set this before dropping UID
+    # and before candidate code can allocate memory. Descendants inherit it.
+    with open("/proc/self/oom_score_adj", "w") as f:
+        f.write("1000")
     os.setgroups([])
     os.setresgid(CANDIDATE_GID, CANDIDATE_GID, CANDIDATE_GID)
     os.setresuid(CANDIDATE_UID, CANDIDATE_UID, CANDIDATE_UID)
     # Set NPROC AFTER changing UID, avoiding execve's PF_NPROC_EXCEEDED trap.
     # These hard limits and the irreversible credential drop survive exec.
-    resource.setrlimit(resource.RLIMIT_NPROC, (128, 128))
+    resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+    # COBOL compiler and executables fit comfortably below the 2 GiB pod limit.
+    # Preserve a tighter inherited budget (also used by the Linux regression).
+    for kind in (resource.RLIMIT_AS, resource.RLIMIT_DATA):
+        hard = resource.getrlimit(kind)[1]
+        budget = 1024 * 1024 * 1024
+        if hard != resource.RLIM_INFINITY:
+            budget = min(budget, hard)
+        resource.setrlimit(kind, (budget, budget))
     resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
@@ -125,15 +137,24 @@ def kill_group(pgid):
 
 
 def sweep_uid():
-    # NPROC must permit compiler subprocesses/JVM threads. Repeatedly sweep the
-    # reserved UID and reap adopted descendants, including setsid escapees.
+    # No fork/exec here: descendants may have exhausted their process budget.
+    # Scan all sessions, then reap adopted children (this process is a subreaper).
     until = time.monotonic() + 3
     while True:
-        result = subprocess.run(["/usr/bin/pkill", "-KILL", "-u", str(CANDIDATE_UID)],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=1)
-        if result.returncode not in (0, 1):
-            raise RuntimeError("UID sweep failed")
+        active = False
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open("/proc/" + name + "/status") as stream:
+                    status = dict(line.split(":", 1) for line in stream if ":" in line)
+                if status["Uid"].split()[0] == str(CANDIDATE_UID) and status["State"].split()[0] not in {"Z", "X"}:
+                    os.kill(int(name), signal.SIGKILL)
+                    active = True
+            except ProcessLookupError:
+                pass
+            except FileNotFoundError:
+                pass
         while True:
             try:
                 pid, _ = os.waitpid(-1, os.WNOHANG)
@@ -141,7 +162,7 @@ def sweep_uid():
                 break
             if pid == 0:
                 break
-        if result.returncode == 1:
+        if not active:
             return
         if time.monotonic() >= until:
             raise RuntimeError("UID sweep did not complete")
@@ -158,19 +179,44 @@ def run_step(argv, timeout, candidate_work):
             stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True,
             start_new_session=True, preexec_fn=restrict_child,
         )
-        timed_out = False
+        status = dict(returncode=125, timeout=False, overflow=False,
+                      cleanup_failed=False, supervisor_error=False)
+        output = b""
         try:
-            returncode = child.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+            try:
+                status["returncode"] = child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                status["timeout"] = True
+        except Exception:
+            status["supervisor_error"] = True
         finally:
-            kill_group(child.pid)
-            returncode = child.wait()
-            sweep_uid()
-        stdout.seek(0)
-        output = stdout.read(limit + 1)
-        overflow = len(output) >= limit or os.fstat(stderr.fileno()).st_size >= limit
-        return dict(returncode=returncode, timeout=timed_out, overflow=overflow), output
+            # Every operation after launch is fallible. Preserve the wait status
+            # and sign a failure even when cleanup, reaping or output reads fail.
+            try:
+                kill_group(child.pid)
+            except Exception:
+                status["cleanup_failed"] = True
+            try:
+                status["returncode"] = child.wait(timeout=1)
+            except Exception:
+                status["cleanup_failed"] = True
+            try:
+                sweep_uid()
+            except Exception:
+                status["cleanup_failed"] = True
+        try:
+            stdout.seek(0)
+            output = stdout.read(limit + 1)
+            status["overflow"] = len(output) >= limit or os.fstat(stderr.fileno()).st_size >= limit
+        except Exception:
+            status["supervisor_error"] = True
+        return status, output
+
+
+stage = "compile"
+status = dict(returncode=125, timeout=False, overflow=False,
+              cleanup_failed=False, supervisor_error=False)
+output = b""
 
 
 try:
@@ -187,8 +233,8 @@ try:
             f.write(content)
         os.chmod(path, 0o644)
     status, output = run_step(request["argv"], request["timeout"], candidate_work)
-    stage = "compile"
-    if status["returncode"] == 0 and not status["timeout"] and not status["overflow"] and "run_argv" in request:
+    if (status["returncode"] == 0 and not any(status[flag] for flag in
+            ("timeout", "overflow", "cleanup_failed", "supervisor_error")) and "run_argv" in request):
         stage = "run"
         status, output = run_step(request["run_argv"], request["run_timeout"], candidate_work)
         if "output_file" in request and status["returncode"] == 0 and not status["timeout"]:
@@ -207,10 +253,21 @@ try:
             except (OSError, ValueError):
                 status["returncode"] = 125
                 output = b""
-    body = json.dumps({**status, "stage": stage,
-                      "output": base64.b64encode(output).decode("ascii"), "cwd": work}, separators=(",", ":"))
-    tag = hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
-    sys.stdout.write(json.dumps({"body": body, "tag": tag}))
+except Exception:
+    # Launch errors (e.g. EAGAIN), unsafe/missing output, and post-run I/O errors
+    # must not erase a candidate outcome. Never include exception text or bytes.
+    status["supervisor_error"] = True
 finally:
-    shutil.rmtree(work, ignore_errors=True)
+    try:
+        shutil.rmtree(work)
+    except Exception:
+        status["cleanup_failed"] = True
+
+# All candidate/post-run errors above become authenticated failures. There are
+# no post-candidate cleanup spawns; receipt emission is the last operation.
+body = json.dumps({**status, "stage": stage,
+                  "output": base64.b64encode(output).decode("ascii"), "cwd": work}, separators=(",", ":"))
+tag = hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
+sys.stdout.write(json.dumps({"body": body, "tag": tag}))
+sys.stdout.flush()
 '''
