@@ -12,7 +12,7 @@ import re
 
 from inspect_ai.scorer import CORRECT, INCORRECT, Score, Target, accuracy, scorer
 from inspect_ai.solver import TaskState
-from inspect_ai.util import OutputLimitExceededError, sandbox
+from inspect_ai.util import sandbox
 
 from .dataset import load_records
 from .publication import private_grading
@@ -93,7 +93,7 @@ def coboleval_scorer():
                             else:
                                 receipt = None
                         except Exception:
-                            # No authenticated supervisor report is a failed test,
+                            # No authenticated supervisor report is a harness failure,
                             # including a killed supervisor or lost exec response.
                             receipt = None
                     finally:
@@ -105,17 +105,13 @@ def coboleval_scorer():
                         except asyncio.CancelledError:
                             await cleanup
                             raise
-            except TimeoutError:
-                return Score(value=INCORRECT, explanation=f"Test {index}: supervisor did not complete. Compiled: unknown.")
-            except OutputLimitExceededError:
-                return Score(value=INCORRECT, explanation=f"Test {index}: supervisor did not complete. Compiled: unknown.")
             except Exception:
                 # Provider exceptions may embed stdin or captured output. Do not
                 # allow them (or their exception chain) into an Inspect error event.
                 raise RuntimeError("Private sandbox operation failed; details withheld.") from None
             # Neither success nor returncode from the run provider is a verdict channel.
             if receipt is None:
-                return Score(value=INCORRECT, explanation=f"Test {index}: supervisor did not complete. Compiled: unknown.")
+                raise RuntimeError("Private sandbox operation failed; details withheld.") from None
             compiled = "yes" if (receipt['stage'] == 'run' or
                                  (receipt['returncode'] == 0 and not receipt['timeout'])) else "no"
             evidence = f" Compiled: {compiled} (caller {index}; later callers not attempted)."
@@ -138,7 +134,7 @@ def coboleval_scorer():
             return await private_score(state, target)
         except Exception:
             pass
-        raise RuntimeError("Private scoring failed; details withheld.") from None
+        raise RuntimeError("Private sandbox operation failed; details withheld.") from None
 
     return score
 
