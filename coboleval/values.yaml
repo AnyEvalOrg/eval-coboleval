@@ -26,7 +26,7 @@ services:
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
-        add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
+        add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE", "SYS_PTRACE"]
       seccompProfile:
         type: RuntimeDefault
     volumeMounts:
@@ -34,6 +34,7 @@ services:
         mountPath: /tmp
       - name: shm
         mountPath: /dev/shm
+        readOnly: true
     volumes:
       - name: tmp
         emptyDir:
@@ -43,19 +44,15 @@ services:
           medium: Memory
           sizeLimit: 16Mi
     # Equal CPU/memory requests and limits provide Guaranteed QoS.
-    # Budget: 768 MiB aggregate candidate RSS watchdog + at most one 50 ms
-    # allocation burst + /dev/shm + supervisor must fit below 2 GiB.
-    # Native RLIMIT_AS/DATA=1 GiB supplements the aggregate RSS watchdog.
-    # gVisor records oom_score_adj but does not use it for host sandbox OOM;
-    # the watchdog, not OOM victim preference, protects the supervisor.
-    # Pod ephemeral-storage: 1 GiB; disk-backed /tmp emptyDir sizeLimit: 512 MiB
-    # is an eviction backstop, not a synchronous filesystem limit. gVisor does
-    # not enforce memory emptyDir sizeLimit as a tmpfs size. The disk watchdog
-    # sums allocated blocks across ALL of /tmp and /dev/shm: 256 MiB + one
-    # 100 ms write burst; gVisor gofer write throughput makes that burst small.
-    # /dev/shm retains medium Memory / sizeLimit 16 MiB; the watchdog covers it
-    # too rather than trusting that sizeLimit. Root filesystem stays read-only.
-    # RLIMIT_NPROC=64 reserves slots below the reference Docker pids limit (128).
+    # Memory: 768 MiB aggregate RSS + one 50 ms burst + up to 256 MiB of
+    # descriptor-retained memfds + one 100 ms write burst + supervisor < 2 GiB.
+    # Writable memory-backed filesystem space is zero: /dev/shm is read-only.
+    # /tmp is disk-backed (512 MiB eviction backstop, not a synchronous limit).
+    # The watchdog bounds directory-visible plus descriptor-retained allocated
+    # bytes to 256 MiB + a scan/write burst, and directory entries to 10,000.
+    # RLIMIT_NPROC=64; RLIMIT_NOFILE=256 native / 1024 Java bounds fd scanning.
+    # Native AS/DATA=1 GiB supplements RSS. gVisor does not use oom_score_adj
+    # for host sandbox OOM selection; watchdogs protect the supervisor.
     resources:
       requests:
         cpu: "1"

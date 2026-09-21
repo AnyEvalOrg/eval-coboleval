@@ -21,7 +21,8 @@ RECEIPTS = runpy.run_path(str(ROOT / 'coboleval/receipts.py'))
 CASES = runpy.run_path(str(Path(__file__).with_name('regression_cases.py')))
 FLAGS = CASES['FLAGS']
 PYTHON = '/usr/local/bin/python3'
-NESTED_CASES = ('memory_aggregate', 'disk', 'detached_child')
+NESTED_CASES = ('memory_aggregate', 'disk', 'detached_child',
+                'unlinked_files', 'memfd', 'empty_files', 'readonly_shm', 'ptrace_denied')
 STEPS = frozenset(('startup', 'cobol_smoke', 'invalid_utf8', 'fork_exhaustion',
                    'memory_exhaustion', 'docker') + NESTED_CASES)
 LABELS = frozenset((
@@ -83,6 +84,7 @@ while True:
 CHECK_LIMITS = '''import os, resource
 assert os.getresuid() == (65532,) * 3
 assert resource.getrlimit(resource.RLIMIT_NPROC) == (64, 64)
+assert resource.getrlimit(resource.RLIMIT_NOFILE) == (256, 256)
 assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
 assert resource.getrlimit(resource.RLIMIT_FSIZE) == (4096, 4096)
 for kind in (resource.RLIMIT_AS, resource.RLIMIT_DATA):
@@ -205,7 +207,10 @@ def docker_command(image, docker_cli='docker'):
     # is removed with --rm; the supervisor watchdog bounds allocated storage.
     return [docker_cli, 'run', '--rm', '--init', '--network=none', '--memory=2g',
             '--memory-swap=2g', '--read-only', '--mount', 'type=volume,target=/tmp',
-            '--tmpfs', '/dev/shm:size=16m', '--pids-limit=128', '--user=0:0',
+            '--tmpfs', '/dev/shm:ro,size=16m', '--pids-limit=128', '--user=0:0',
+            '--cap-drop=ALL', '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL',
+            '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=SYS_PTRACE',
+            '--security-opt=no-new-privileges:true',
             '--mount', f'type=bind,source={ROOT},target={ROOT},readonly',
             image, PYTHON, str(ROOT / 'scripts/linux_regressions.py'), '--memory-child']
 
@@ -269,14 +274,14 @@ def main():
         # downgrade the cgroup regression to the weaker prlimit fallback.
         with step('docker'):
             require(args.image, 'docker-image-required')
-            result = captured(docker_command(args.image, docker_cli), timeout=90)
+            result = captured(docker_command(args.image, docker_cli), timeout=240)
             # Relay completed cases and the sanitized child error even on exit 1.
             summary = relay_nested_output(result.stdout)
             require(result.returncode == 0, 'docker-completed')
             require(summary is not None, 'docker-summary')
             for name, flags in summary.items():
                 require(flags['memory_exceeded'] == (name == 'memory_aggregate')
-                        and flags['disk_exceeded'] == (name == 'disk')
+                        and flags['disk_exceeded'] == (name in CASES['DISK_CASES'])
                         and not any(value for flag, value in flags.items()
                                     if flag not in {'memory_exceeded', 'disk_exceeded'}),
                         'expected-flags')

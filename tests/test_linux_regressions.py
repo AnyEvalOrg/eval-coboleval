@@ -82,11 +82,11 @@ def test_child_emits_case_flags_before_checks_and_summary(monkeypatch, capsys, f
                            output='ok')
         name = regression.NESTED_CASES[case_index]
         case_index += 1
-        code = {'memory_aggregate': -9, 'disk': -9, 'detached_child': 0}[name]
+        code = 0 if name == 'detached_child' else 1 if name in {'readonly_shm', 'ptrace_denied'} else -9
         if fault == 'case' and name == 'disk':
             code = 0
-        return receipt(returncode=code, output='disk-direct-tmp' if name == 'disk' else SECRET,
-                       memory_exceeded=name == 'memory_aggregate', disk_exceeded=name == 'disk')
+        return receipt(returncode=code, output={'disk': 'disk-direct-tmp', 'ptrace_denied': 'ptrace-denied'}.get(name, SECRET),
+                       memory_exceeded=name == 'memory_aggregate', disk_exceeded=name in regression.CASES['DISK_CASES'])
 
     monkeypatch.setattr(regression, 'invoke', invoke)
     monkeypatch.setattr(regression.sys, 'argv', ['linux_regressions.py', '--memory-child'])
@@ -98,7 +98,7 @@ def test_child_emits_case_flags_before_checks_and_summary(monkeypatch, capsys, f
     assert [item['case'] for item in cases] == list(regression.NESTED_CASES[:len(cases)])
     assert all(set(item) == {'case', 'flags'} and regression.valid_flags(item['flags']) for item in cases)
     if fault is None:
-        assert len(cases) == 3
+        assert len(cases) == len(regression.NESTED_CASES)
         assert output[-1] == {item['case']: item['flags'] for item in cases}
     else:
         assert len(cases) == 2
@@ -119,7 +119,7 @@ def outer(monkeypatch):
 
 def nested_records():
     return [{'case': name, 'flags': {flag: (flag == 'memory_exceeded' and name == 'memory_aggregate')
-                                    or (flag == 'disk_exceeded' and name == 'disk')
+                                    or (flag == 'disk_exceeded' and name in regression.CASES['DISK_CASES'])
                                     for flag in regression.FLAGS}}
             for name in regression.NESTED_CASES]
 
@@ -192,7 +192,21 @@ def test_cloud_build_passes_the_copied_cli_explicitly():
     assert f'cp "$$(command -v docker)" {cli}' in script
     assert f'--docker-cli {cli}' in script
     assert '--image' in script and '/var/run/docker.sock' in script
+    assert '--read-only --mount type=volume,target=/tmp --tmpfs /dev/shm:ro,size=16m' in script
     command = regression.docker_command('synthetic-image', cli)
     assert command[0] == cli
     assert '--read-only' in command and 'type=volume,target=/tmp' in command
+    assert command[command.index('--tmpfs') + 1] == '/dev/shm:ro,size=16m'
     assert 'dir="/tmp"' in regression.SUPERVISOR['SETUP']
+
+
+def test_docker_and_cloudbuild_capabilities_match_production():
+    command = regression.docker_command('synthetic-image')
+    script = Path(regression.__file__).with_name('cloudbuild-linux-regressions.yaml').read_text()
+    expected = {'SETUID', 'SETGID', 'KILL', 'CHOWN', 'DAC_OVERRIDE', 'SYS_PTRACE'}
+    assert {arg.split('=', 1)[1] for arg in command if arg.startswith('--cap-add=')} == expected
+    assert '--cap-drop=ALL' in command and '--cap-drop=ALL' in script
+    assert '--security-opt=no-new-privileges:true' in command
+    for capability in expected:
+        assert '--cap-add=' + capability in script
+    assert 'ptrace_denied' in regression.NESTED_CASES

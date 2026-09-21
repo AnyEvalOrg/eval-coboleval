@@ -539,3 +539,19 @@ def test_last_passing_test_with_failed_cleanup_is_incorrect(monkeypatch):
     score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
     assert score.value == INCORRECT
     assert 'candidate left processes that could not be cleaned up' in score.explanation
+
+
+@pytest.mark.parametrize('valid_json', [False, True])
+def test_nonzero_setup_is_withheld_harness_error_and_never_launches_candidate(monkeypatch, valid_json):
+    class FailedPrerequisites(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if scoring.SETUP in cmd:
+                self.calls.append((cmd, kwargs))
+                stdout = json.dumps({'cwd': '/tmp/cjt-probe', 'key': self.key.hex()}) if valid_json else ''
+                return result(stdout, returncode=1)
+            assert scoring.RUNNER not in cmd
+            return await super().exec(cmd, **kwargs)
+    fake = FailedPrerequisites([])
+    install_sandbox(monkeypatch, fake)
+    assert_private_sandbox_error()
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND

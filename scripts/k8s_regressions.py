@@ -43,11 +43,15 @@ def run_regressions():
                 cleanup_after = 0
                 try:
                     setup = await bounded_exec(env, SETUP, input=json.dumps(CASES['request_for_case'](name)))
+                    if setup.returncode != 0:
+                        raise RuntimeError("Sandbox setup failed")
                     launch = json.loads(setup.stdout)
                     work, key = launch['cwd'], bytes.fromhex(launch['key'])
                     if len(key) != 32 or not re.fullmatch(r'/tmp/cjt-[a-zA-Z0-9_-]+', work):
                         raise ValueError('Invalid setup')
                     cleanup_after = asyncio.get_running_loop().time() + 40
+                    # The outer deadline includes signing; empty-file traversal
+                    # must never extend it. All cases use this bound.
                     result = await bounded_exec(env, RUNNER, work, timeout=35)
                     receipt = verify_receipt(result.stdout, key)
                     if receipt is not None and receipt['cwd'] == work:
