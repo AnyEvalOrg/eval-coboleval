@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import sys
 import pytest
-from coboleval.sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIESCENCE_COMMAND
+from coboleval.sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIESCENCE_COMMAND, DIRECTORY_CLEANUP_COMMAND
 from coboleval.scoring import verify_receipt
 
 
@@ -41,6 +41,8 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
         source = source.replace('os.chown(candidate_work, CANDIDATE_UID, CANDIDATE_GID)', 'pass')
         source = source.replace('info.st_uid != CANDIDATE_UID', 'info.st_uid != os.getuid()')
         source = source.replace('os.killpg(pgid, sig)', 'os.kill(pgid, sig)')
+        source = source.replace('def candidate_rss():', 'def candidate_rss():\n    return 0\n')
+        source = source.replace('def disk_bytes(roots=("/tmp", "/dev/shm")):', 'def disk_bytes(roots=("/tmp", "/dev/shm")):\n    return 0\n')
         start, end = source.index('def sweep_uid():'), source.index('def run_step(')
         source = source[:start] + 'def sweep_uid():\n    pass\n\n\n' + source[end:]
     source = transform(source)
@@ -50,7 +52,7 @@ def run_fixture(compile_code='pass', run_code="print('ok')", timeout=1, output_f
         assert result.returncode == 0, result.stderr
         receipt = verify_receipt(result.stdout, bytes.fromhex(setup['key']))
         assert receipt is not None
-        assert not Path(setup['cwd']).exists()
+        assert Path(setup['cwd']).exists()  # Deletion belongs to independent cleanup.
         return receipt
     finally:
         shutil.rmtree(setup['cwd'], ignore_errors=True)
@@ -67,7 +69,7 @@ def output_limit_runner():
         yield partial(run_fixture, real_supervisor=real)
     finally:
         if real:
-            for command in (CLEANUP_COMMAND, QUIESCENCE_COMMAND):
+            for command in (CLEANUP_COMMAND, QUIESCENCE_COMMAND, DIRECTORY_CLEANUP_COMMAND):
                 result = subprocess.run(command, capture_output=True, timeout=6)
                 assert result.returncode in ((0, 1) if command == CLEANUP_COMMAND else (0,))
 
@@ -202,7 +204,7 @@ status =''')
     assert receipt['returncode'] == 1 and not receipt['cleanup_failed']
 
 
-@pytest.mark.parametrize('operation', ['sweep', 'kill_group', 'read', 'rmtree'])
+@pytest.mark.parametrize('operation', ['sweep', 'kill_group', 'read'])
 def test_post_exit_exceptions_still_sign_failure(operation):
     def transform(source):
         if operation == 'sweep':
@@ -216,8 +218,6 @@ subprocess.run = fail_spawn''')
             return source.replace('            kill_group(child.pid)', '            raise OSError("synthetic kill failure")')
         if operation == 'read':
             return source.replace('            stdout.seek(0)', '            raise OSError("synthetic output failure")')
-        # Actually remove first so the fixture can still assert no directory.
-        return source.replace('        shutil.rmtree(work)', '        shutil.rmtree(work)\n        raise OSError("synthetic cleanup failure")')
     receipt = run_fixture(compile_code='raise SystemExit(1)', transform=transform)
     assert receipt['returncode'] == 1
     assert receipt['supervisor_error'] if operation == 'read' else receipt['cleanup_failed']
@@ -256,3 +256,184 @@ def test_actual_preexec_limits_and_oom_preference(inherited):
                            resource.RLIMIT_FSIZE: (4096, 4096), resource.RLIMIT_CORE: (0, 0)}
     opener.assert_called_once_with('/proc/self/oom_score_adj', 'w')
     stream.write.assert_called_once_with('1000')
+
+
+@pytest.mark.parametrize('rss_kib,exceeded', [(384 * 1024, False), (384 * 1024 + 1, True)])
+def test_watchdog_sums_reserved_uid_rss_and_kills_all_sessions(rss_kib, exceeded):
+    import io
+    import signal
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    names = ['1', '2', '3', '4', '5', '6', 'self']
+    proc = {
+        '1': 'Uid:\t0 0 0 0\nVmRSS:\t999999999 kB\n',
+        '2': f'Uid:\t65532 65532 65532 65532\nVmRSS:\t{rss_kib} kB\n',
+        '3': f'Uid:\t65532 65532 65532 65532\nVmRSS:\t{rss_kib} kB\n',
+        '4': 'Uid:\t65532 65532 65532 65532\nState:\tZ (zombie)\n',
+    }
+    def opener(path):
+        pid = path.split('/')[2]
+        if pid not in proc:
+            raise FileNotFoundError(path)
+        return io.StringIO(proc[pid])
+    process_api = SimpleNamespace(listdir=Mock(return_value=names), kill=Mock(), killpg=Mock())
+    stopped = Mock()
+    stopped.is_set.return_value = False
+    stopped.wait.return_value = True
+    status = dict(memory_exceeded=False, supervisor_error=False, cleanup_failed=False)
+    namespace = dict(os=process_api, open=opener, signal=signal, CANDIDATE_UID=65532,
+                     MEMORY_BUDGET=768 * 1024**2, MEMORY_INTERVAL=0.05)
+    tree = ast.parse(RUNNER)
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and
+                 n.name in {'candidate_rss', 'kill_candidate', 'watch_memory'}]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), '<watchdog>', 'exec'), namespace)
+    namespace['watch_memory'](42, stopped, status)
+    assert status['memory_exceeded'] is exceeded
+    assert not status['supervisor_error'] and not status['cleanup_failed']
+    if exceeded:
+        process_api.killpg.assert_called_once_with(42, signal.SIGKILL)
+        assert [call.args for call in process_api.kill.call_args_list] == [
+            (2, signal.SIGKILL), (3, signal.SIGKILL), (4, signal.SIGKILL)]
+        stopped.wait.assert_not_called()
+    else:
+        process_api.killpg.assert_not_called()
+        process_api.kill.assert_not_called()
+        stopped.wait.assert_called_once_with(0.05)
+
+
+def test_memory_flag_is_signed_and_blocks_next_stage():
+    def transform(source):
+        return source.replace('def candidate_rss():\n    return 0',
+                              'def candidate_rss():\n    return MEMORY_BUDGET + 1').replace(
+                                  'def kill_candidate(pgid):',
+                                  'def kill_candidate(pgid):\n    os.kill(pgid, signal.SIGKILL)\n    return')
+    receipt = run_fixture(compile_code='import time; time.sleep(1)', transform=transform)
+    assert receipt['memory_exceeded'] and receipt['stage'] == 'compile'
+    from coboleval.receipts import receipt_failure
+    assert receipt_failure(receipt) == 'memory limit exceeded'
+
+
+def disk_namespace(**overrides):
+    import errno
+    import stat
+    namespace = dict(os=os, errno=errno, stat=stat, DISK_BUDGET=256 * 1024**2,
+                     DISK_INTERVAL=0.1)
+    namespace.update(overrides)
+    functions = [n for n in ast.parse(RUNNER).body if isinstance(n, ast.FunctionDef)
+                 and n.name in {'disk_bytes', 'watch_disk'}]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), '<disk-watchdog>', 'exec'), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize('exceeded', [False, True])
+def test_disk_watchdog_counts_allocated_blocks_across_roots(tmp_path, exceeded):
+    from unittest.mock import Mock
+    roots = [tmp_path / 'tmp', tmp_path / 'shm']
+    work = roots[0] / 'work' / 'candidate'
+    other = roots[0] / 'outside-work'
+    for directory in (work, other, roots[1]):
+        directory.mkdir(parents=True)
+    files = [work / 'one', other / 'two', roots[1] / 'three']
+    for path in files:
+        path.write_bytes(b'x' * 8192)
+    sparse = work / 'sparse'
+    with sparse.open('wb') as stream:
+        stream.truncate(1024**3)
+    files.append(sparse)
+    outside = tmp_path / 'not-mounted'
+    outside.mkdir()
+    (outside / 'ignored').write_bytes(b'x' * 32768)
+    (other / 'dir-link').symlink_to(outside, target_is_directory=True)
+    (other / 'file-link').symlink_to(files[0])
+    (other / 'cycle').symlink_to(roots[0], target_is_directory=True)
+    os.mkfifo(other / 'fifo')
+    namespace = disk_namespace(kill_candidate=Mock())
+    total = sum(path.stat().st_blocks * 512 for path in files)
+    measure = namespace['disk_bytes']
+    assert measure(roots) == total
+    namespace['disk_bytes'] = lambda: measure(roots)
+    namespace['DISK_BUDGET'] = total - 1 if exceeded else total
+    stopped = Mock()
+    stopped.is_set.return_value = False
+    stopped.wait.return_value = True
+    status = dict(disk_exceeded=False, supervisor_error=False, cleanup_failed=False)
+    namespace['watch_disk'](42, stopped, status)
+    assert status == dict(disk_exceeded=exceeded, supervisor_error=False, cleanup_failed=False)
+    if exceeded:
+        namespace['kill_candidate'].assert_called_once_with(42)
+        stopped.wait.assert_not_called()
+    else:
+        namespace['kill_candidate'].assert_not_called()
+        stopped.wait.assert_called_once_with(0.1)
+
+
+@pytest.mark.parametrize('replacement', ['removed', 'symlink'])
+def test_disk_walk_tolerates_directory_replacement_without_following_symlinks(tmp_path, replacement):
+    from types import SimpleNamespace
+    root = tmp_path / 'tmp'
+    child = root / 'raced'
+    child.mkdir(parents=True)
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'ignored').write_bytes(b'x' * 8192)
+    original_open = os.open
+    def raced_open(path, flags, **kwargs):
+        if path == 'raced':
+            child.rmdir()
+            if replacement == 'symlink':
+                child.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, **kwargs)
+    api = SimpleNamespace(**{name: getattr(os, name) for name in
+        ('O_RDONLY', 'O_DIRECTORY', 'O_NOFOLLOW', 'O_NONBLOCK', 'scandir', 'close')}, open=raced_open)
+    assert disk_namespace(os=api)['disk_bytes']([root, tmp_path / 'missing']) == 0
+
+
+@pytest.mark.parametrize('kill_fails', [False, True])
+def test_disk_monitor_error_fails_closed(kill_fails):
+    from unittest.mock import Mock
+    kill = Mock(side_effect=OSError('kill failed') if kill_fails else None)
+    namespace = disk_namespace(kill_candidate=kill)
+    namespace['disk_bytes'] = Mock(side_effect=PermissionError('scan failed'))
+    stopped = Mock()
+    stopped.is_set.return_value = False
+    status = dict(disk_exceeded=False, supervisor_error=False, cleanup_failed=False)
+    namespace['watch_disk'](42, stopped, status)
+    assert status == dict(disk_exceeded=False, supervisor_error=True, cleanup_failed=kill_fails)
+    kill.assert_called_once_with(42)
+
+
+def test_disk_flag_is_signed_and_blocks_next_stage():
+    def transform(source):
+        return source.replace('def disk_bytes(roots=("/tmp", "/dev/shm")):\n    return 0',
+                              'def disk_bytes(roots=("/tmp", "/dev/shm")):\n    return DISK_BUDGET + 1').replace(
+                                  'def kill_candidate(pgid):',
+                                  'def kill_candidate(pgid):\n    os.kill(pgid, signal.SIGKILL)\n    return')
+    receipt = run_fixture(compile_code='import time; time.sleep(1)', transform=transform)
+    assert receipt['disk_exceeded'] and receipt['stage'] == 'compile'
+    assert receipt['returncode'] != 0
+    from coboleval.receipts import receipt_failure
+    assert receipt_failure(receipt) == 'disk limit exceeded'
+
+
+@pytest.mark.parametrize('hanging', [False, True], ids=['ordering', 'hanging-deletion'])
+def test_complete_receipt_precedes_any_directory_deletion(tmp_path, hanging):
+    marker = tmp_path / 'deleted'
+    def transform(source):
+        # This would record (or hang on) any deletion in the runner, including
+        # Python shutdown hooks. Only independent cleanup may delete work.
+        hook = f'''
+import shutil, atexit
+
+def forbidden_delete(*args, **kwargs):
+    open({str(marker)!r}, 'w').write('deletion attempted')
+    {'time.sleep(60)' if hanging else 'raise RuntimeError("deletion before receipt")'}
+shutil.rmtree = forbidden_delete
+atexit.register(forbidden_delete)
+'''
+        return source.replace('stage = "compile"\nstatus =', hook + '\nstage = "compile"\nstatus =')
+    receipt = run_fixture(transform=transform)
+    assert receipt['stage'] == 'run' and receipt['returncode'] == 0
+    assert not marker.exists()
+    # The independent exec is explicitly bounded, including shell globbing.
+    assert DIRECTORY_CLEANUP_COMMAND[:4] == ['timeout', '-s', 'KILL', '5s']
+    assert DIRECTORY_CLEANUP_COMMAND[-1] == 'exec rm -rf -- /tmp/cjt-*'

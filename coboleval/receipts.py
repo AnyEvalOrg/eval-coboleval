@@ -19,6 +19,8 @@ def verify_receipt(stdout: str, key: bytes) -> dict | None:
                 or type(receipt["overflow"]) is not bool
                 or receipt.get("stage") not in {"compile", "run"}
                 or not re.fullmatch(r"/tmp/cjt-[a-zA-Z0-9_-]+", receipt["cwd"])
+                or type(receipt.get("memory_exceeded", False)) is not bool
+                or type(receipt.get("disk_exceeded", False)) is not bool
                 or type(receipt.get("cleanup_failed", False)) is not bool
                 or type(receipt.get("supervisor_error", False)) is not bool):
             return None
@@ -40,6 +42,10 @@ def verify_receipt(stdout: str, key: bytes) -> dict | None:
 
 def receipt_failure(receipt: dict) -> str | None:
     """Shared by the scorer and real Linux regressions; a reason means INCORRECT."""
+    if receipt.get("memory_exceeded"):
+        return "memory limit exceeded"
+    if receipt.get("disk_exceeded"):
+        return "disk limit exceeded"
     if receipt.get("output_error"):
         return "output not decodable"
     if receipt.get("cleanup_failed"):

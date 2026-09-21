@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 import pytest
-from coboleval.sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIESCENCE_COMMAND
+from coboleval.sandbox_runner import SETUP, RUNNER, CLEANUP_COMMAND, QUIESCENCE_COMMAND, DIRECTORY_CLEANUP_COMMAND
 from coboleval.scoring import cleanup_candidate, verify_receipt
 
 pytestmark = pytest.mark.skipif(
@@ -34,7 +34,7 @@ def prepare(code):
 
 
 def independent_cleanup():
-    for command in (CLEANUP_COMMAND, QUIESCENCE_COMMAND):
+    for command in (CLEANUP_COMMAND, QUIESCENCE_COMMAND, DIRECTORY_CLEANUP_COMMAND):
         result = subprocess.run(command, capture_output=True, timeout=6)
         assert result.returncode in ((0, 1) if command == CLEANUP_COMMAND else (0,))
 
@@ -82,6 +82,8 @@ print(pid, flush=True)
         receipt = verify_receipt(result.stdout, bytes.fromhex(setup['key']))
         assert receipt and receipt['returncode'] == 0 and receipt['stage'] == 'run'
         assert not process_running(int(receipt['output']))
+        assert Path(setup['cwd']).exists()
+        independent_cleanup()
         assert not Path(setup['cwd']).exists()
     finally:
         independent_cleanup()

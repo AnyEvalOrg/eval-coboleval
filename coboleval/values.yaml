@@ -23,21 +23,44 @@ services:
       runAsGroup: 0
       runAsNonRoot: false
       allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
         add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
       seccompProfile:
         type: RuntimeDefault
-    # Equal CPU/memory requests and limits give Guaranteed QoS, avoiding
-    # eviction preference for a Burstable supervisor. Each COBOL child has
-    # RLIMIT_AS/RLIMIT_DATA=1 GiB; 2 GiB leaves headroom for root supervision,
-    # compiler helpers and capture buffers. Children inherit oom_score_adj=1000.
+    volumeMounts:
+      - name: tmp
+        mountPath: /tmp
+      - name: shm
+        mountPath: /dev/shm
+    volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 512Mi
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Mi
+    # Equal CPU/memory requests and limits provide Guaranteed QoS.
+    # Budget: 768 MiB aggregate candidate RSS watchdog + at most one 50 ms
+    # allocation burst + /dev/shm + supervisor must fit below 2 GiB.
+    # Native RLIMIT_AS/DATA=1 GiB supplements the aggregate RSS watchdog.
+    # gVisor records oom_score_adj but does not use it for host sandbox OOM;
+    # the watchdog, not OOM victim preference, protects the supervisor.
+    # Pod ephemeral-storage: 1 GiB; disk-backed /tmp emptyDir sizeLimit: 512 MiB
+    # is an eviction backstop, not a synchronous filesystem limit. gVisor does
+    # not enforce memory emptyDir sizeLimit as a tmpfs size. The disk watchdog
+    # sums allocated blocks across ALL of /tmp and /dev/shm: 256 MiB + one
+    # 100 ms write burst; gVisor gofer write throughput makes that burst small.
+    # /dev/shm retains medium Memory / sizeLimit 16 MiB; the watchdog covers it
+    # too rather than trusting that sizeLimit. Root filesystem stays read-only.
     # RLIMIT_NPROC=64 reserves slots below the reference Docker pids limit (128).
     resources:
       requests:
         cpu: "1"
         memory: 2Gi
-        # Disk-backed /tmp/cjt-* requests, candidate files and captured streams.
+        # Candidate files/captures now live in disk-backed /tmp.
         ephemeral-storage: 1Gi
       limits:
         cpu: "1"

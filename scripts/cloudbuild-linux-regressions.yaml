@@ -19,7 +19,7 @@ steps:
           --pids-limit=128 --user=0:0 \
           --mount type=bind,source=/workspace,target=/workspace,readonly \
           --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock \
-          --env PATH=/workspace/.linux-regressions-bin:/usr/local/bin:/usr/bin:/bin \
           '${_IMAGE}' /usr/local/bin/python3 /workspace/scripts/linux_regressions.py \
+          --docker-cli /workspace/.linux-regressions-bin/docker \
           --image '${_IMAGE}'
 timeout: 600s

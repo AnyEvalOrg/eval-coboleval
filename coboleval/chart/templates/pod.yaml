@@ -17,6 +17,8 @@ spec:
   automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
   restartPolicy: Never
   enableServiceLinks: false
+  volumes:
+    {{- toYaml $service.volumes | nindent 4 }}
   containers:
     - name: default
       image: {{ $service.image }}
@@ -24,5 +26,7 @@ spec:
       workingDir: {{ $service.workingDir }}
       securityContext:
         {{- toYaml $service.securityContext | nindent 8 }}
+      volumeMounts:
+        {{- toYaml $service.volumeMounts | nindent 8 }}
       resources:
         {{- toYaml $service.resources | nindent 8 }}

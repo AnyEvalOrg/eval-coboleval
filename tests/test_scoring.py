@@ -25,7 +25,7 @@ class FakeSandbox:
             return result(json.dumps({"cwd": self.paths[-1], "key": self.key.hex()}))
         if cmd == scoring.CLEANUP_COMMAND:
             return result("", returncode=1)
-        if cmd == scoring.QUIESCENCE_COMMAND:
+        if cmd in (scoring.QUIESCENCE_COMMAND, scoring.DIRECTORY_CLEANUP_COMMAND):
             return result("", returncode=0)
         response = next(self.results)
         if isinstance(response, Exception):
@@ -44,6 +44,8 @@ def signed_receipt(key, cwd, output="2", **kwargs):
     body = json.dumps(dict(returncode=kwargs.get("returncode", 0),
                            timeout=kwargs.get("timeout", False),
                            overflow=kwargs.get("overflow", False), stage=kwargs.get("stage", "run"), cwd=cwd,
+                           memory_exceeded=kwargs.get("memory_exceeded", False),
+                           disk_exceeded=kwargs.get("disk_exceeded", False),
                            cleanup_failed=kwargs.get("cleanup_failed", False),
                            supervisor_error=kwargs.get("supervisor_error", False),
                            output=base64.b64encode(output if isinstance(output, bytes) else output.encode()).decode()))
@@ -110,9 +112,9 @@ def test_scorer_results_with_fake_sandbox(monkeypatch, outcome):
     assert f'Compiled: {compiled}' in score.explanation
     assert not score.metadata and not score.answer
     count = 2 if outcome == 'correct' else 1
-    assert len(fake.calls) == count * 4
+    assert len(fake.calls) == count * 5
     assert len(set(fake.paths)) == count
-    for setup, run, cleanup in zip(fake.calls[::4], fake.calls[1::4], fake.calls[2::4]):
+    for setup, run, cleanup in zip(fake.calls[::5], fake.calls[1::5], fake.calls[2::5]):
         assert cleanup[0] == scoring.CLEANUP_COMMAND
         assert setup[0][:4] == ['timeout', '-s', 'KILL', '5s']
         assert run[0][:4] == ['timeout', '-s', 'KILL', '100s']
@@ -159,7 +161,7 @@ def test_lost_supervisor_response_is_an_error(monkeypatch, failure):
     fake = FakeSandbox([failure])
     install_sandbox(monkeypatch, fake)
     assert_private_sandbox_error()
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 def test_output_limit_is_an_error(monkeypatch):
@@ -181,7 +183,7 @@ def test_forged_completion_marker_or_receipt_is_an_error(monkeypatch, forgery):
     install_sandbox(monkeypatch, fake)
     assert_private_sandbox_error()
     assert fake.paths == ['/tmp/cjt-fresh_1']  # No second setup after rejection.
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 def test_marker_inside_captured_candidate_output_cannot_hide_failure(monkeypatch):
@@ -211,7 +213,7 @@ def test_authenticated_failure_channels(monkeypatch, field, value):
 def test_setup_timeout_is_bounded_and_errors(monkeypatch):
     class HungSetup(FakeSandbox):
         async def exec(self, cmd, **kwargs):
-            if cmd in (scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND):
+            if cmd in (scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND, scoring.DIRECTORY_CLEANUP_COMMAND):
                 return await super().exec(cmd, **kwargs)
             assert cmd[:4] == ["timeout", "-s", "KILL", "5s"]
             assert kwargs["timeout"] == 5
@@ -274,8 +276,9 @@ def test_cleanup_failure_aborts_before_next_test(monkeypatch, failure):
 
     fake = FailedCleanup([result()])
     install_sandbox(monkeypatch, fake)
-    with pytest.raises(RuntimeError, match='details withheld'):
-        asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    assert score.value == INCORRECT
+    assert "candidate left processes that could not be cleaned up" in score.explanation
     assert len(fake.paths) == 1
     assert fake.calls[-1][0] == scoring.CLEANUP_COMMAND
 
@@ -291,7 +294,7 @@ def test_scorer_cancellation_still_awaits_independent_uid_sweep(monkeypatch):
     install_sandbox(monkeypatch, fake)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize('failure', [TimeoutError(), ConnectionError(),
@@ -306,7 +309,7 @@ def test_setup_failure_also_issues_uid_cleanup(monkeypatch, failure):
     fake = FailedSetup([])
     install_sandbox(monkeypatch, fake)
     assert_private_sandbox_error()
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 def test_cleanup_requires_quiescence_before_reusing_sandbox(monkeypatch):
@@ -318,8 +321,9 @@ def test_cleanup_requires_quiescence_before_reusing_sandbox(monkeypatch):
             return await super().exec(cmd, **kwargs)
     fake = StillRunning([result()])
     install_sandbox(monkeypatch, fake)
-    with pytest.raises(RuntimeError, match='details withheld'):
-        asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    assert score.value == INCORRECT
+    assert "candidate left processes that could not be cleaned up" in score.explanation
     assert len(fake.paths) == 1
     assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
 
@@ -330,7 +334,7 @@ def test_receipt_for_another_directory_is_an_error(monkeypatch):
     install_sandbox(monkeypatch, fake)
     assert_private_sandbox_error()
     assert fake.paths == ['/tmp/cjt-fresh_1']  # No second setup after rejection.
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize('operation', [scoring.SETUP, scoring.RUNNER], ids=['setup', 'runner'])
@@ -348,8 +352,8 @@ def test_exec_that_never_returns_is_bounded_and_errors(monkeypatch, operation):
     fake = HungExec([])
     install_sandbox(monkeypatch, fake)
     assert_private_sandbox_error()
-    assert fake.calls[-2][0] == scoring.CLEANUP_COMMAND
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-3][0] == scoring.CLEANUP_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize('response', [
@@ -385,7 +389,7 @@ def test_receipt_rejection_is_an_inspect_sample_error(monkeypatch, tmp_path, res
     for secret in ('PRIVATE_EXCEPTION_STDIN_STDOUT_STDERR', 'PRIVATE_CALLER',
                    'PRIVATE_PYTHON_SOLUTION', 'synthetic candidate'):
         assert secret not in sample.error.model_dump_json()
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize('completion', ['no code', '    indented source'])
@@ -440,7 +444,7 @@ def test_authenticated_non_utf8_is_incorrect(monkeypatch, output):
     score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
     assert score.value == INCORRECT
     assert 'output not decodable' in score.explanation
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize('output', [None, 42, [], {}, '\u2603', '%%%','/w=='])
@@ -464,19 +468,74 @@ def test_missing_output_is_authenticated_failure():
 
 @pytest.mark.parametrize('field,value', [('stage', []), ('stage', 'other'), ('returncode', True),
     ('timeout', 0), ('overflow', None), ('cwd', '/tmp/other'), ('cwd', []),
-    ('cleanup_failed', 'yes'), ('supervisor_error', 1)])
+    ('cleanup_failed', 'yes'), ('supervisor_error', 1), ('memory_exceeded', 1), ('disk_exceeded', 1), ('disk_exceeded', None), ('disk_exceeded', 'yes')])
 def test_supervisor_fields_still_require_strict_shapes(field, value):
     fields = json.loads(json.loads(signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1'))['body'])
     fields[field] = value
     assert scoring.verify_receipt(resign(fields), bytes(range(32))) is None
 
 
-@pytest.mark.parametrize('flag', ['cleanup_failed', 'supervisor_error'])
+@pytest.mark.parametrize('flag', ['cleanup_failed', 'supervisor_error', 'memory_exceeded', 'disk_exceeded'])
 def test_signed_post_run_failure_is_incorrect_and_independently_cleaned(monkeypatch, flag):
     fake = FakeSandbox([signed_receipt(bytes(range(32)), '/tmp/cjt-fresh_1', **{flag: True})])
     install_sandbox(monkeypatch, fake)
     score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
     assert score.value == INCORRECT
-    assert fake.calls[-2][0] == scoring.CLEANUP_COMMAND
-    assert fake.calls[-1][0] == scoring.QUIESCENCE_COMMAND
+    assert fake.calls[-3][0] == scoring.CLEANUP_COMMAND
+    assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
     assert len(fake.paths) == 1
+
+
+@pytest.mark.parametrize('cleanup_command', [scoring.CLEANUP_COMMAND, scoring.QUIESCENCE_COMMAND,
+                                           scoring.DIRECTORY_CLEANUP_COMMAND],
+                         ids=['uid-sweep', 'quiescence', 'deletion'])
+@pytest.mark.parametrize('outcome', ['signed-failure', 'signed-success', 'wrong-answer', 'no-receipt'])
+@pytest.mark.parametrize('cleanup_error', [False, True], ids=['nonzero', 'timeout'])
+def test_verdict_is_resolved_before_independent_cleanup(monkeypatch, cleanup_command, outcome, cleanup_error):
+    events = []
+    original = scoring.receipt_failure
+    def verdict(receipt):
+        events.append('verdict')
+        return original(receipt)
+    monkeypatch.setattr(scoring, 'receipt_failure', verdict)
+
+    class FailedCleanup(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd == cleanup_command:
+                events.append('cleanup')
+                if cleanup_error:
+                    raise TimeoutError('PRIVATE cleanup failure')
+                return result('', returncode=2)
+            return await super().exec(cmd, **kwargs)
+
+    response = '' if outcome == 'no-receipt' else signed_receipt(
+        bytes(range(32)), '/tmp/cjt-fresh_1',
+        output='9' if outcome == 'wrong-answer' else '2', timeout=outcome == 'signed-failure')
+    fake = FailedCleanup([response])
+    install_sandbox(monkeypatch, fake)
+    if outcome == 'no-receipt':
+        assert_private_sandbox_error()
+        assert events == ['cleanup']
+    else:
+        score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+        assert score.value == INCORRECT
+        explanation = {'signed-failure': 'run timeout', 'wrong-answer': 'wrong answer',
+                       'signed-success': 'candidate left processes that could not be cleaned up'}[outcome]
+        assert explanation in score.explanation
+        assert events == ['verdict', 'cleanup']
+    assert len(fake.paths) == 1
+
+
+def test_last_passing_test_with_failed_cleanup_is_incorrect(monkeypatch):
+    single = record()
+    single['tests'] = single['tests'][:1]
+    monkeypatch.setattr(scoring, 'load_records', lambda: [single])
+    class FailedCleanup(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd == scoring.QUIESCENCE_COMMAND:
+                return result('', returncode=2)
+            return await super().exec(cmd, **kwargs)
+    install_sandbox(monkeypatch, FailedCleanup([result()]))
+    score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    assert score.value == INCORRECT
+    assert 'candidate left processes that could not be cleaned up' in score.explanation
