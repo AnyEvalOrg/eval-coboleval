@@ -15,6 +15,7 @@ from .receipts import verify_receipt, receipt_failure
 from .dataset import load_records
 from .publication import private_grading
 from .sandbox_runner import CLEANUP_COMMAND, QUIESCENCE_COMMAND, DIRECTORY_CLEANUP_COMMAND, RUNNER, SETUP
+from .sandbox_state import MEMORY_EXHAUSTED, STORAGE_EXHAUSTED, sandbox_failure, sandbox_identity
 from .execution import execution_request
 from .cleaning import extract_code_block, construct
 from .comparison import parse, is_equal
@@ -55,6 +56,9 @@ def coboleval_scorer():
             # inside one root supervisor; no candidate-controlled driver verdict.
             deadline = payload['timeout'] + payload['run_timeout'] + 10
             receipt = None
+            setup_succeeded = False
+            kernel_failure = None
+            identity = None
             failure = None
             cleanup_failed = False
             cleanup_after = 0
@@ -76,6 +80,8 @@ def coboleval_scorer():
                             raise RuntimeError("Invalid setup key")
                         if not re.fullmatch(r"/tmp/cjt-[a-zA-Z0-9_-]+", work):
                             raise RuntimeError("Invalid setup directory")
+                        setup_succeeded = True
+                        identity = sandbox_identity(env)
                         # If exec returns early without a receipt, wait through
                         # the outer deadline before sweeping: the supervisor may
                         # still be starting. This uses the host monotonic clock.
@@ -99,8 +105,8 @@ def coboleval_scorer():
                             else:
                                 receipt = None
                         except Exception:
-                            # No authenticated supervisor report is a harness failure,
-                            # including a killed supervisor or lost exec response.
+                            # Kernel attribution below is the only fallback for a
+                            # killed supervisor or a lost exec response.
                             receipt = None
                     finally:
                         # A separate sandbox exec, never the candidate's parent or
@@ -117,12 +123,24 @@ def coboleval_scorer():
                             # Preserve signed failures, and reject a passing
                             # candidate that prevents cleanup before another test.
                             cleanup_failed = True
+                    if setup_succeeded and receipt is None:
+                        kernel_failure = await sandbox_failure(env, identity=identity)
             except Exception:
                 # Provider exceptions may embed stdin or captured output. Do not
                 # allow them (or their exception chain) into an Inspect error event.
                 raise RuntimeError("Private sandbox operation failed; details withheld.") from None
             # Neither success nor returncode from the run provider is a verdict channel.
             if receipt is None:
+                attributed = kernel_failure_score(kernel_failure, index)
+                if attributed is not None:
+                    return attributed
+                # Even exit 137 from `timeout -s KILL` cannot authenticate that
+                # RUNNER started or reached its deadline. Running pod + no receipt
+                # stays a withheld harness error: transport/node stalls must not
+                # enter the rate as candidate failures. Ordinary slow candidates
+                # get signed timeout failures; confirmed pod OOM/storage loss is
+                # scored above, preventing these attacks from dropping runs.
+                # Ambiguous loss blocks publication, never silently drops a sample.
                 raise RuntimeError("Private sandbox operation failed; details withheld.") from None
             compiled = "yes" if (receipt['stage'] == 'run' or
                                  (receipt['returncode'] == 0 and not receipt['timeout'])) else "no"
@@ -172,3 +190,12 @@ async def cleanup_candidate(environment, not_before: float = 0) -> None:
     except Exception:
         # No provider exception text can escape into Inspect logs.
         raise RuntimeError("Private sandbox cleanup failed; details withheld.") from None
+
+
+def kernel_failure_score(failure: str | None, index: int = 1) -> Score | None:
+    """Shared by scoring and the production regression; fixed evidence only."""
+    if failure not in (MEMORY_EXHAUSTED, STORAGE_EXHAUSTED):
+        return None
+    return Score(value=INCORRECT, explanation=
+                 f"Test {index}: {failure}. Compiled: unknown "
+                 f"(caller {index}; later callers not attempted).")

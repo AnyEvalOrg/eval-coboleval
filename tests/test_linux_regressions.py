@@ -140,6 +140,7 @@ def test_outer_relays_child_json_lines_even_on_failure(monkeypatch, capsys, oute
                                stdout='\n'.join(json.dumps(item) for item in child).encode())
 
     monkeypatch.setattr(regression, 'captured', captured)
+    monkeypatch.setattr(regression, 'kernel_docker_cases', lambda *args: None)
     assert regression.entrypoint() == int(failed)
     output = records(capsys)[2:]
     assert output[:len(child)] == child
@@ -210,3 +211,120 @@ def test_docker_and_cloudbuild_capabilities_match_production():
     for capability in expected:
         assert '--cap-add=' + capability in script
     assert 'ptrace_denied' in regression.NESTED_CASES
+
+
+@pytest.mark.parametrize('outcome', ['memory', 'disk', 'oom', 'refused', 'missing', 'unsigned',
+                                     'setup_missing', 'bad_flags', 'signed_137', 'inspected_oom', 'partial_137',
+                                     'exit_1', 'exit_125'])
+def test_kernel_docker_accepts_watchdog_receipt_or_unsigned_137(capsys, outcome):
+    report = {flag: False for flag in regression.FLAGS}
+    report.update(signed=True, expected=True, sysv_refused=outcome == 'refused')
+    report['memory_exceeded'] = outcome in ('memory', 'signed_137')
+    report['disk_exceeded'] = outcome == 'disk'
+    child = [{'setup_succeeded': True}]
+    code = 0
+    if outcome in ('oom', 'setup_missing', 'signed_137', 'partial_137'):
+        code = 137
+    if outcome in ('inspected_oom', 'exit_1', 'exit_125'):
+        code = 125 if outcome == 'exit_125' else 1
+    if outcome == 'setup_missing':
+        child = []
+    elif outcome not in ('oom', 'missing'):
+        if outcome == 'unsigned':
+            report['signed'] = False
+        if outcome == 'bad_flags':
+            report['memory_exceeded'] = SECRET
+        child.append(report)
+    result = SimpleNamespace(returncode=code, stderr=SECRET.encode(),
+                             stdout='\n'.join(json.dumps(line) for line in child).encode())
+    if outcome == 'partial_137':
+        result.stdout = SECRET.encode()
+    if outcome in ('memory', 'disk', 'oom', 'setup_missing', 'signed_137', 'inspected_oom', 'partial_137'):
+        flags = regression.kernel_docker_flags(result, oom_killed=outcome == 'inspected_oom')
+        assert all(type(value) is bool for value in flags.values())
+        assert flags['exit_137'] == (code == 137)
+        assert flags['oom_killed'] == (outcome == 'inspected_oom')
+        assert flags['signed'] == (outcome in ('memory', 'disk'))
+    else:
+        with pytest.raises(AssertionError):
+            regression.kernel_docker_flags(result)
+    assert records(capsys) == []
+
+
+@pytest.mark.parametrize(('code', 'oom_killed'), [(137, False), (137, True), (1, True)])
+def test_kernel_docker_cases_have_separate_containers_and_flags_only(monkeypatch, capsys, code, oom_killed):
+    commands = []
+    def captured(command, **kwargs):
+        commands.append(command)
+        if command[1] == 'inspect':
+            return SimpleNamespace(returncode=0, stdout=b'true\n' if oom_killed else b'false\n')
+        if command[1] == 'rm':
+            return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=code, stdout=b'', stderr=SECRET.encode())
+    monkeypatch.setattr(regression, 'captured', captured)
+    regression.kernel_docker_cases('image', 'docker')
+    assert len(commands) == 9
+    runs = commands[::3]
+    assert [cmd[-2:] for cmd in runs] == [['--kernel-child', name] for name in regression.KERNEL_CASES]
+    assert all('--memory=2g' in cmd and '--rm' not in cmd for cmd in runs)
+    names = [cmd[cmd.index('--name') + 1] for cmd in runs]
+    assert len(set(names)) == 3
+    for index, name in enumerate(names):
+        assert commands[index * 3 + 1] == ['docker', 'inspect', '--format', '{{.State.OOMKilled}}', name]
+        assert commands[index * 3 + 2] == ['docker', 'rm', '-f', '-v', name]
+    output = records(capsys)
+    assert [item['case'] for item in output] == list(regression.KERNEL_CASES)
+    assert all(all(type(value) is bool for value in item['flags'].values()) for item in output)
+    assert all(item['returncode'] == code and item['flags']['expected']
+               and item['flags']['oom_killed'] == oom_killed for item in output)
+
+
+def test_outer_runs_kernel_cases_after_watchdog_summary(monkeypatch, capsys, outer):
+    child = nested_records()
+    child.append({item['case']: item['flags'] for item in child})
+    commands = []
+    def captured(command, **kwargs):
+        commands.append(command)
+        if command[1] == 'inspect':
+            return SimpleNamespace(returncode=0, stdout=b'false\n')
+        if command[1] == 'rm':
+            return SimpleNamespace(returncode=0)
+        if '--kernel-child' in command:
+            return SimpleNamespace(returncode=137, stdout=b'{"setup_succeeded": true}\n', stderr=b'')
+        return SimpleNamespace(returncode=0, stderr=b'',
+                               stdout='\n'.join(json.dumps(item) for item in child).encode())
+    monkeypatch.setattr(regression, 'captured', captured)
+    assert regression.entrypoint() == 0
+    assert commands[0][-1] == '--memory-child'
+    assert [cmd[-1] for cmd in commands[1::3]] == list(regression.KERNEL_CASES)
+    assert [item['case'] for item in records(capsys)[-3:]] == list(regression.KERNEL_CASES)
+
+
+@pytest.mark.parametrize('fault', ['exit', 'inspect', 'inspect_output', 'output', 'cleanup', 'timeout'])
+def test_kernel_failures_log_exit_and_flags_and_always_cleanup(monkeypatch, capsys, fault):
+    commands = []
+
+    def captured(command, **kwargs):
+        commands.append(command)
+        if command[1] == 'inspect':
+            return SimpleNamespace(returncode=int(fault == 'inspect'),
+                                   stdout=SECRET.encode() if fault == 'inspect_output' else b'false\n')
+        if command[1] == 'rm':
+            return SimpleNamespace(returncode=int(fault == 'cleanup'))
+        if fault == 'timeout':
+            raise subprocess.TimeoutExpired(SECRET, 60, output=SECRET.encode())
+        return SimpleNamespace(returncode=1 if fault == 'exit' else 0 if fault == 'output' else 137,
+                               stdout=SECRET.encode(), stderr=SECRET.encode())
+
+    monkeypatch.setattr(regression, 'captured', captured)
+    monkeypatch.setattr(regression, 'main', lambda: regression.kernel_docker_cases('image', 'docker'))
+    assert regression.entrypoint() == 1
+    assert commands[-1][1:4] == ['rm', '-f', '-v']
+    case, error = records(capsys)
+    assert case['case'] == error['step'] == 'sysv_shm'
+    assert case['returncode'] == (None if fault == 'timeout' else 1 if fault == 'exit'
+                                  else 0 if fault == 'output' else 137)
+    assert all(type(value) is bool for value in case['flags'].values())
+    assert error['label'] == {'exit': 'docker-completed', 'output': 'docker-completed',
+                              'inspect': 'docker-inspect', 'inspect_output': 'docker-inspect',
+                              'cleanup': 'docker-cleanup', 'timeout': 'unexpected-error'}[fault]

@@ -14,17 +14,19 @@ import runpy
 import shutil
 import subprocess
 import sys
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 SUPERVISOR = runpy.run_path(str(ROOT / 'coboleval/sandbox_runner.py'))
 RECEIPTS = runpy.run_path(str(ROOT / 'coboleval/receipts.py'))
 CASES = runpy.run_path(str(Path(__file__).with_name('regression_cases.py')))
 FLAGS = CASES['FLAGS']
+KERNEL_CASES = CASES['KERNEL_CASES']
 PYTHON = '/usr/local/bin/python3'
 NESTED_CASES = ('memory_aggregate', 'disk', 'detached_child',
                 'unlinked_files', 'memfd', 'empty_files', 'readonly_shm', 'ptrace_denied')
 STEPS = frozenset(('startup', 'cobol_smoke', 'invalid_utf8', 'fork_exhaustion',
-                   'memory_exhaustion', 'docker') + NESTED_CASES)
+                   'memory_exhaustion', 'docker') + NESTED_CASES + KERNEL_CASES)
 LABELS = frozenset((
     'unexpected-error', 'linux-root', 'reserved-uid-unused', 'setup-completed',
     'runner-completed', 'authenticated-receipt', 'descendants-stopped',
@@ -34,6 +36,7 @@ LABELS = frozenset((
     'invalid-utf8-receipt', 'fork-exhaustion-receipt', 'memory-exhaustion-receipt',
     'smoke-succeeded', 'smoke-output', 'expected-receipt', 'docker-image-required',
     'docker-completed', 'docker-output', 'docker-summary', 'prlimit-required',
+    'docker-inspect', 'docker-cleanup',
 ))
 # Nested stdout is untrusted. Only these class names may be relayed from it.
 ERROR_CLASSES = frozenset((
@@ -113,12 +116,14 @@ def no_candidates():
     return True
 
 
-def invoke(request, *, budget=False):
+def invoke(request, *, budget=False, allow_oom=False):
     require(no_candidates(), 'reserved-uid-unused')
     setup_result = captured(['timeout', '-s', 'KILL', '5s', PYTHON, '-I', '-c', SUPERVISOR['SETUP']],
                             data=json.dumps(request).encode(), timeout=6)
     require(setup_result.returncode == 0, 'setup-completed')
     setup = json.loads(setup_result.stdout)
+    if allow_oom:
+        emit({'setup_succeeded': True})
     try:
         command = ['timeout', '-s', 'KILL', '30s', PYTHON, '-I', '-c', SUPERVISOR['RUNNER'], setup['cwd']]
         if budget:
@@ -128,8 +133,11 @@ def invoke(request, *, budget=False):
             command = ['prlimit', '--as=402653184:402653184',
                        '--data=402653184:402653184', '--'] + command
         result = captured(command, timeout=35)
-        require(result.returncode == 0, 'runner-completed')
         receipt = RECEIPTS['verify_receipt'](result.stdout, bytes.fromhex(setup['key']))
+        if allow_oom and receipt is None and result.returncode in (-9, 137):
+            # Preserve the killed RUNNER status for the outer Docker assertion.
+            raise SystemExit(137)
+        require(result.returncode == 0, 'runner-completed')
         require(receipt is not None and receipt['cwd'] == setup['cwd'], 'authenticated-receipt')
         require(no_candidates(), 'descendants-stopped')
         require(Path(setup['cwd']).exists(), 'directory-retained')
@@ -199,20 +207,22 @@ def aggregate_and_disk_cases():
     return summaries
 
 
-def docker_command(image, docker_cli='docker'):
+def docker_command(image, docker_cli='docker', *, kernel_case=None, container_name=None):
     # The daemon must see ROOT at the same absolute path. Cloud Build's /workspace
     # volume satisfies this for both the outer and nested containers.
     # /tmp is writable despite --read-only: SETUP uses /tmp/cjt-* and cobc
     # writes scratch files there. An anonymous disk volume permits ./smoke and
-    # is removed with --rm; the supervisor watchdog bounds allocated storage.
-    return [docker_cli, 'run', '--rm', '--init', '--network=none', '--memory=2g',
+    # is removed with --rm or explicit rm -v after inspecting kernel cases.
+    lifecycle = ['--name', container_name] if container_name else ['--rm']
+    return [docker_cli, 'run', *lifecycle, '--init', '--network=none', '--memory=2g',
             '--memory-swap=2g', '--read-only', '--mount', 'type=volume,target=/tmp',
             '--tmpfs', '/dev/shm:ro,size=16m', '--pids-limit=128', '--user=0:0',
             '--cap-drop=ALL', '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=KILL',
             '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=SYS_PTRACE',
             '--security-opt=no-new-privileges:true',
             '--mount', f'type=bind,source={ROOT},target={ROOT},readonly',
-            image, PYTHON, str(ROOT / 'scripts/linux_regressions.py'), '--memory-child']
+            image, PYTHON, str(ROOT / 'scripts/linux_regressions.py')] + (
+                ['--kernel-child', kernel_case] if kernel_case else ['--memory-child'])
 
 
 def valid_flags(flags):
@@ -254,13 +264,88 @@ def relay_nested_output(data):
     return summary
 
 
+def kernel_child(name):
+    receipt = invoke(CASES['request_for_case'](name), allow_oom=True)
+    flags = {flag: bool(receipt.get(flag, False)) for flag in FLAGS}
+    flags.update(signed=True, expected=CASES['expected_receipt'](name, receipt, RECEIPTS['receipt_failure']),
+                 sysv_refused=CASES['sysv_refused'](name, receipt))
+    emit(flags)
+    require(flags['expected'], 'expected-receipt')
+
+
+def kernel_flags():
+    return dict.fromkeys((*FLAGS, 'signed', 'expected', 'sysv_refused',
+                          'exit_137', 'oom_killed'), False)
+
+
+def kernel_docker_flags(result, *, oom_killed=False, flags=None):
+    """Accept a signed watchdog receipt or Docker sandbox death; flags only."""
+    if flags is None:
+        flags = kernel_flags()
+    flags.update(exit_137=result.returncode == 137, oom_killed=oom_killed)
+    if flags['exit_137'] or flags['oom_killed']:
+        # PID 1 can die before flushing even the SETUP marker. No child output
+        # is needed or relayed for this outcome, including partial JSON.
+        flags['expected'] = True
+        return flags
+    lines = result.stdout.splitlines()
+    require(result.returncode == 0 and len(lines) == 2, 'docker-completed')
+    require(json.loads(lines[0]) == {'setup_succeeded': True}, 'docker-output')
+    report = json.loads(lines[1])
+    expected_keys = set(FLAGS) | {'signed', 'expected', 'sysv_refused'}
+    require(type(report) is dict and set(report) == expected_keys
+            and all(type(value) is bool for value in report.values()), 'docker-output')
+    flags.update(report)
+    flags['expected'] = (report['signed'] and report['expected'] and
+                         (report['memory_exceeded'] or report['disk_exceeded']))
+    require(flags['expected'], 'expected-receipt')
+    return flags
+
+
+def kernel_docker_cases(image, docker_cli):
+    # One fresh container each, LAST: retained SysV segments need pod/container
+    # teardown even after the UID sweep, and any of these cases may kill PID 1.
+    for name in KERNEL_CASES:
+        with step(name):
+            container_name = f'linux-regression-{name}-{uuid.uuid4().hex}'
+            flags = kernel_flags()
+            returncode = None
+            try:
+                result = captured(docker_command(image, docker_cli, kernel_case=name,
+                                                 container_name=container_name), timeout=60)
+                returncode = result.returncode
+                flags['exit_137'] = returncode == 137
+                inspected = captured([docker_cli, 'inspect', '--format',
+                                      '{{.State.OOMKilled}}', container_name], timeout=10)
+                require(inspected.returncode == 0 and inspected.stdout.strip() in (b'true', b'false'),
+                        'docker-inspect')
+                kernel_docker_flags(result, oom_killed=inspected.stdout.strip() == b'true', flags=flags)
+                require(not flags['sysv_refused'] or name == 'sysv_shm', 'expected-flags')
+            finally:
+                emit({'case': name, 'returncode': returncode, 'flags': flags})
+                # Remove the container and its anonymous /tmp volume even when
+                # parsing, inspection, or the run itself fails. Keep the first
+                # failure's attribution if cleanup fails as well.
+                failed = sys.exc_info()[0] is not None
+                try:
+                    cleaned = captured([docker_cli, 'rm', '-f', '-v', container_name], timeout=10)
+                    require(cleaned.returncode == 0, 'docker-cleanup')
+                except Exception:
+                    if not failed:
+                        raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', help='reference image tag/digest for the nested memory and disk regressions')
     parser.add_argument('--docker-cli', help='Docker CLI path in the outer container (fails closed if unavailable)')
     parser.add_argument('--memory-child', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--kernel-child', choices=KERNEL_CASES, help=argparse.SUPPRESS)
     args = parser.parse_args()
     require(sys.platform == 'linux' and os.geteuid() == 0, 'linux-root')
+    if args.kernel_child:
+        kernel_child(args.kernel_child)
+        return
     if args.memory_child:
         emit(aggregate_and_disk_cases())
         return
@@ -286,6 +371,7 @@ def main():
                                     if flag not in {'memory_exceeded', 'disk_exceeded'}),
                         'expected-flags')
             emit(summary)
+        kernel_docker_cases(args.image, docker_cli)
     else:
         with step('memory_exhaustion'):
             require(shutil.which('prlimit'), 'prlimit-required')

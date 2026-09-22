@@ -3,6 +3,7 @@ import asyncio
 import json
 from pathlib import Path
 import runpy
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -21,10 +22,11 @@ def test_production_regression_uses_exact_package_sandbox():
     assert task.sandbox == coboleval().sandbox
     assert task.sandbox.type == 'k8s'
     assert str(ModelName(task.model)) == 'mockllm/model'
-    assert len(task.dataset) == 1
+    assert [sample.id for sample in task.dataset] == list(regression.SAMPLE_IDS)
     assert set(regression.CASES['CASES']) == {
         'invalid_utf8', 'fork_exhaustion', 'memory_aggregate', 'disk',
-        'detached_child', 'unlinked_files', 'memfd', 'empty_files', 'readonly_shm', 'ptrace_denied'}
+        'detached_child', 'unlinked_files', 'memfd', 'empty_files', 'readonly_shm', 'ptrace_denied',
+        'sysv_shm', 'memfd_mapped_closed', 'socketpair_queues'}
 
 
 @pytest.mark.parametrize('fault', [None, 'unsigned', 'memory_flag', 'disk_flag', 'cleanup', 'pod_lost', 'deadline', 'shm_write', 'ptrace_allowed'])
@@ -75,7 +77,7 @@ def test_production_regression_requires_receipts_flags_cleanup_and_usable_pod(mo
     monkeypatch.setattr(asyncio, 'sleep', no_sleep)
     fake = FakeSandbox()
     monkeypatch.setattr(regression, 'sandbox', lambda: SandboxEnvironmentProxy(fake))
-    state = SimpleNamespace(metadata={})
+    state = SimpleNamespace(sample_id='runtime-regressions', metadata={})
     state = asyncio.run(regression.run_regressions()(state, None))
     score = asyncio.run(regression.regression_scorer()(state, Target('')))
     assert score.value == (CORRECT if fault is None else INCORRECT)
@@ -151,3 +153,90 @@ def test_ptrace_candidate_only_witnesses_permission_errors(monkeypatch, capsys, 
         assert capsys.readouterr().out == ''
         if outcome == 'allowed':
             assert raised.value.code == 2
+
+
+@pytest.mark.parametrize('name', regression.KERNEL_CASES)
+@pytest.mark.parametrize('outcome', ['memory', 'disk', 'oom', 'last_oom', 'sigkill', 'signal', 'running', 'gone',
+                                     'storage_eviction', 'setup_failure', 'unsigned', 'signed_timeout', 'refused'])
+def test_kernel_regression_accepts_only_receipt_or_attributed_oom(monkeypatch, capsys, name, outcome):
+    from coboleval.sandbox_state import classify_pod
+    from test_sandbox_state import pod
+    calls = []
+    cleanup_times = []
+    identity = object()
+    class FakeSandbox:
+        async def exec(self, cmd, **kwargs):
+            if regression.SETUP in cmd:
+                assert json.loads(kwargs['input']) == regression.CASES['request_for_case'](name)
+                return result(json.dumps({'cwd': '/tmp/cjt-kernel', 'key': bytes(range(32)).hex()}),
+                              returncode=1 if outcome == 'setup_failure' else 0)
+            if regression.RUNNER in cmd:
+                if outcome in ('oom', 'last_oom', 'sigkill', 'signal', 'running', 'gone', 'storage_eviction'):
+                    raise TimeoutError('PRIVATE output')
+                if outcome == 'unsigned':
+                    return result('PRIVATE output')
+                return result(signed_receipt(bytes(range(32)), '/tmp/cjt-kernel',
+                    output='sysv-shm-refused' if outcome == 'refused' else '',
+                    returncode=0 if outcome == 'refused' else -9,
+                    memory_exceeded=outcome == 'memory', disk_exceeded=outcome == 'disk',
+                    timeout=outcome == 'signed_timeout'))
+            cleanup_times.append(time.monotonic())
+            raise ConnectionError('PRIVATE cleanup or probe output')
+    async def no_sleep(delay):
+        pass
+    async def lookup(environment, **kwargs):
+        calls.append(True)
+        assert kwargs['identity'] is identity
+        assert kwargs['runner_failed_at'] <= cleanup_times[0] <= time.monotonic()
+        value = {'oom': pod(reason='OOMKilled'), 'last_oom': pod(last_reason='OOMKilled'),
+                 'sigkill': pod(reason='Error', exit_code=137), 'signal': pod(reason='Error', signal=9),
+                 'running': pod(), 'storage_eviction': pod(phase='Failed', pod_reason='Evicted',
+                                                         message='ephemeral-storage limit exceeded')}.get(outcome)
+        kwargs['evidence']['pod'] = {'phase': value.status.phase} if value else None
+        return classify_pod(value, expected_uid='sample-uid')
+    monkeypatch.setattr(regression.asyncio, 'sleep', no_sleep)
+    monkeypatch.setattr(regression, 'sandbox', lambda: SandboxEnvironmentProxy(FakeSandbox()))
+    monkeypatch.setattr(regression, 'sandbox_identity', lambda env: identity)
+    monkeypatch.setattr(regression, 'sandbox_failure', lookup)
+    state = SimpleNamespace(sample_id=name, metadata={})
+    state = asyncio.run(regression.run_cases(state))
+    score = asyncio.run(regression.regression_scorer()(state, Target('')))
+    passed = outcome in ('memory', 'disk', 'oom', 'last_oom', 'sigkill', 'signal') or (outcome == 'refused' and name == 'sysv_shm')
+    assert score.value == (CORRECT if passed else INCORRECT)
+    summary = json.loads(capsys.readouterr().out)
+    assert set(summary) == {name}
+    flags = summary[name]
+    assert all(type(value) is bool for value in flags.values())
+    assert flags['oom_killed'] == (outcome in ('oom', 'last_oom', 'sigkill', 'signal'))
+    assert flags['sysv_refused'] == (outcome == 'refused' and name == 'sysv_shm')
+    assert bool(calls) == (outcome in ('oom', 'last_oom', 'sigkill', 'signal', 'running', 'gone', 'storage_eviction', 'unsigned'))
+    assert bool(state.metadata['regression_evidence']) == bool(calls)
+    if calls:
+        assert 'pod' in state.metadata['regression_evidence'][name]
+    assert 'PRIVATE' not in json.dumps(state.metadata)
+
+
+def test_kernel_cases_execute_last_even_with_concurrent_samples(monkeypatch):
+    events = []
+    async def run(state):
+        events.append(('start', state.sample_id))
+        await asyncio.sleep(0)
+        events.append(('end', state.sample_id))
+        return state
+    monkeypatch.setattr(regression, 'run_cases', run)
+    async def run_all():
+        solve = regression.run_regressions()
+        await asyncio.gather(*(solve(SimpleNamespace(sample_id=name), None)
+                               for name in reversed(regression.SAMPLE_IDS)))
+    asyncio.run(run_all())
+    assert events == [(event, name) for name in regression.SAMPLE_IDS for event in ('start', 'end')]
+
+
+@pytest.mark.parametrize('name', regression.KERNEL_CASES)
+def test_kernel_receipts_reject_normal_exit_and_timeout(name):
+    receipt = dict(stage='run', returncode=-9, output='', timeout=True)
+    assert not regression.CASES['expected_receipt'](name, receipt, regression.receipt_failure)
+    receipt.update(timeout=False, returncode=0)
+    assert not regression.CASES['expected_receipt'](name, receipt, regression.receipt_failure)
+    receipt.update(stage='compile', memory_exceeded=True, returncode=-9)
+    assert not regression.CASES['expected_receipt'](name, receipt, regression.receipt_failure)

@@ -21,6 +21,10 @@ class _PrivateFilter(logging.Filter):
 # logger levels globally or suppressing concurrent samples' provenance diagnostics.
 for _name in (
     "k8s_sandbox._logger",
+    "k8s_sandbox._pod.pod",
+    "k8s_sandbox._kubernetes_api",
+    "kubernetes.client.rest",
+    "urllib3.connectionpool",
     "inspect_ai.util._sandbox.docker.compose",
     "inspect_ai.util._sandbox.docker.util",
     "inspect_ai.util._subprocess",

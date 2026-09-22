@@ -555,3 +555,83 @@ def test_nonzero_setup_is_withheld_harness_error_and_never_launches_candidate(mo
     install_sandbox(monkeypatch, fake)
     assert_private_sandbox_error()
     assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
+
+
+@pytest.mark.parametrize('response', ['', TimeoutError('private'), ConnectionError('private'),
+                                      signed_receipt(b'wrong key', '/tmp/cjt-fresh_1')])
+@pytest.mark.parametrize('kind', ['memory', 'storage', 'running', 'lookup_failure'])
+def test_kernel_attribution_after_setup_without_receipt(monkeypatch, response, kind):
+    from coboleval.sandbox_state import MEMORY_EXHAUSTED, STORAGE_EXHAUSTED
+    fake = FakeSandbox([response])
+    install_sandbox(monkeypatch, fake)
+    calls = []
+    async def lookup(environment, **kwargs):
+        assert len(fake.requests) == 1
+        assert fake.calls[-1][0] == scoring.DIRECTORY_CLEANUP_COMMAND
+        calls.append(environment)
+        if kind == 'lookup_failure':
+            raise RuntimeError('PRIVATE API error')
+        return {'memory': MEMORY_EXHAUSTED, 'storage': STORAGE_EXHAUSTED}.get(kind)
+    monkeypatch.setattr(scoring, 'sandbox_failure', lookup)
+    if kind in ('running', 'lookup_failure'):
+        assert_private_sandbox_error()
+    else:
+        score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+        assert score.value == INCORRECT
+        assert score.explanation == (f'Test 1: sandbox {kind} exhausted during candidate execution. '
+                                     'Compiled: unknown (caller 1; later callers not attempted).')
+        assert score.answer is None and not score.metadata
+    assert len(calls) == 1
+    assert len(fake.requests) == 1
+
+
+@pytest.mark.parametrize('failure', [result('', returncode=1), result('bad setup'), TimeoutError('private')])
+def test_setup_failure_never_asks_kubernetes(monkeypatch, failure):
+    class FailedSetup(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if scoring.SETUP in cmd:
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+            return await super().exec(cmd, **kwargs)
+    async def forbidden(*args, **kwargs):
+        pytest.fail('SETUP failure must not be attributed to candidate')
+    monkeypatch.setattr(scoring, 'sandbox_failure', forbidden)
+    install_sandbox(monkeypatch, FailedSetup([]))
+    assert_private_sandbox_error()
+
+
+def test_signed_receipt_never_asks_kubernetes(monkeypatch):
+    async def forbidden(*args, **kwargs):
+        pytest.fail('Signed receipts remain authoritative')
+    monkeypatch.setattr(scoring, 'sandbox_failure', forbidden)
+    install_sandbox(monkeypatch, FakeSandbox([result(), result()]))
+    assert asyncio.run(scoring.coboleval_scorer()(state(), Target(''))).value == CORRECT
+
+
+def test_kernel_verdict_survives_failed_cleanup(monkeypatch):
+    class DeadPod(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd == scoring.CLEANUP_COMMAND:
+                raise ConnectionError('private')
+            return await super().exec(cmd, **kwargs)
+    async def oom(*args, **kwargs):
+        return scoring.MEMORY_EXHAUSTED
+    monkeypatch.setattr(scoring, 'sandbox_failure', oom)
+    install_sandbox(monkeypatch, DeadPod([TimeoutError()]))
+    score = asyncio.run(scoring.coboleval_scorer()(state(), Target('')))
+    assert score.value == INCORRECT
+    assert scoring.MEMORY_EXHAUSTED in score.explanation
+
+
+def test_unsigned_exit_137_with_running_pod_remains_harness_error(monkeypatch):
+    class KilledRunner(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if scoring.RUNNER in cmd:
+                return result('', returncode=137)
+            return await super().exec(cmd, **kwargs)
+    async def running(*args, **kwargs):
+        return None
+    monkeypatch.setattr(scoring, 'sandbox_failure', running)
+    install_sandbox(monkeypatch, KilledRunner([]))
+    assert_private_sandbox_error()

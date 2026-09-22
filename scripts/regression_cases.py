@@ -103,11 +103,83 @@ for path in ('/proc/1/fd/0', '/proc/' + str(os.getppid()) + '/fd/0'):
 print('ptrace-denied', flush=True)
 raise SystemExit(1)
 '''
+# These sinks can outlive their descriptor/mapping or hold kernel-only memory.
+# Keep last and isolate each in its own disposable pod/container.
+SYSV_SHM = r'''import ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmget.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
+libc.shmget.restype = ctypes.c_int
+libc.shmat.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+libc.shmat.restype = ctypes.c_void_p
+libc.shmdt.argtypes = [ctypes.c_void_p]
+libc.shmdt.restype = ctypes.c_int
+count = 0
+while True:
+    segment = libc.shmget(0, 64 * 1024 * 1024, 0o1000 | 0o600)
+    if segment < 0:
+        if count == 0 and ctypes.get_errno() in (errno.ENOSYS, errno.EPERM, errno.EACCES, errno.EOPNOTSUPP):
+            print('sysv-shm-refused', flush=True)
+            raise SystemExit(0)
+        raise SystemExit(2)
+    address = libc.shmat(segment, None, 0)
+    if address == ctypes.c_void_p(-1).value:
+        if count == 0 and ctypes.get_errno() in (errno.ENOSYS, errno.EPERM, errno.EACCES, errno.EOPNOTSUPP):
+            print('sysv-shm-refused', flush=True)
+            raise SystemExit(0)
+        raise SystemExit(2)
+    ctypes.memset(address, 1, 64 * 1024 * 1024)
+    if libc.shmdt(address) != 0:
+        raise SystemExit(2)
+    # Intentionally no IPC_RMID: neither RSS nor fd/path scans see this sink.
+    count += 1
+'''
+MEMFD_MAPPED_CLOSED = r'''import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                      ctypes.c_int, ctypes.c_int, ctypes.c_long]
+libc.mmap.restype = ctypes.c_void_p
+block = b'x' * (1024 * 1024)
+while True:
+    fd = os.memfd_create('mapped')
+    remaining = block
+    while remaining:
+        remaining = remaining[os.write(fd, remaining):]
+    address = libc.mmap(None, 4096, 0, 1, fd, 0)  # PROT_NONE, MAP_SHARED
+    if address == ctypes.c_void_p(-1).value:
+        raise SystemExit(2)
+    os.close(fd)  # Tiny untouched mapping retains the entire one-MiB file.
+'''
+SOCKETPAIR_QUEUES = r'''import os, socket, time
+# Stay below each worker's NOFILE limit while filling both directions. Queued
+# socket buffers are kernel memory; payload copies in userspace stay tiny.
+for _ in range(32):
+    if os.fork() == 0:
+        pairs = []
+        block = b'x' * 65536
+        for _ in range(120):
+            pair = socket.socketpair()
+            pairs.append(pair)
+            for sock in pair:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+                sock.setblocking(False)
+                while True:
+                    try:
+                        sock.send(block)
+                    except BlockingIOError:
+                        break
+        time.sleep(60)
+        os._exit(0)
+for _ in range(32):
+    os.wait()
+'''
+KERNEL_CASES = ('sysv_shm', 'memfd_mapped_closed', 'socketpair_queues')
 CASES = {'invalid_utf8': INVALID_UTF8, 'fork_exhaustion': FORK_EXHAUSTION,
          'memory_aggregate': MEMORY_AGGREGATE, 'disk': DISK,
          'detached_child': DETACHED_CHILD, 'unlinked_files': RETAINED_FILES,
          'memfd': MEMFD, 'empty_files': EMPTY_FILES, 'readonly_shm': READONLY_SHM,
-         'ptrace_denied': PTRACE_DENIED}
+         'ptrace_denied': PTRACE_DENIED,
+         'sysv_shm': SYSV_SHM, 'memfd_mapped_closed': MEMFD_MAPPED_CLOSED,
+         'socketpair_queues': SOCKETPAIR_QUEUES}
 
 
 def request_for_case(name):
@@ -119,6 +191,12 @@ def request_for_case(name):
 def expected_receipt(name, receipt, receipt_failure):
     if receipt is None or receipt['stage'] != 'run':
         return False
+    if name in KERNEL_CASES:
+        if sysv_refused(name, receipt):
+            return True
+        return (receipt['returncode'] != 0
+                and (receipt.get('memory_exceeded', False) or receipt.get('disk_exceeded', False))
+                and receipt_failure(receipt) is not None)
     expected = {flag: False for flag in FLAGS}
     if name == 'invalid_utf8':
         expected['output_error'] = True
@@ -147,3 +225,9 @@ def expected_receipt(name, receipt, receipt_failure):
         return (receipt['returncode'] == 1 and receipt['output'].strip() == 'ptrace-denied'
                 and receipt_failure(receipt) is not None)
     return receipt['returncode'] == 1 and receipt_failure(receipt) is not None
+
+
+def sysv_refused(name, receipt):
+    return (name == 'sysv_shm' and receipt is not None and receipt['stage'] == 'run'
+            and receipt['returncode'] == 0 and receipt['output'].strip() == 'sysv-shm-refused'
+            and not any(receipt.get(flag, False) for flag in FLAGS))
